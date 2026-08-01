@@ -96,9 +96,10 @@ print(results.window_stats)          # build/solve seconds per window
 
 ## Input data
 
-Six CSVs in one directory. Profile files (`demand.csv`,
-`availability_factors.csv`) may include a leading `hour` column; rows are
-hours in order and both files must cover the same horizon.
+Six CSVs in one directory (`availability_factors.csv` is optional). Profile
+files (`demand.csv`, `availability_factors.csv`) may include a leading
+`hour` column; rows are hours in order and both files must cover the same
+horizon.
 
 | File | Contents |
 |---|---|
@@ -107,7 +108,7 @@ hours in order and both files must cover the same horizon.
 | `node_locations.csv` | `node`, `latitude`, `longitude` |
 | `network.csv` | One row per line: `from_node`, `to_node`, `capacity_mw`, `loss_factor`; optional `line` name |
 | `demand.csv` | Hourly MW, one column per node (missing nodes = zero load) |
-| `availability_factors.csv` | Hourly fraction in [0, 1], one column per unit (missing units = fully available) |
+| `availability_factors.csv` | Hourly fraction in [0, 1]; only units that need derating need a column (missing units — or a missing file — mean fully available) |
 
 Fuel burn when a unit is on is `intercept + slope × MW`, so fuel cost splits
 into a no-load ($/hr while committed) and a marginal ($/MWh) component.
@@ -138,8 +139,9 @@ clean baseline for solver experiments. Units that need no on/off state
 (zero minimum, no startup/no-load costs — typically wind and solar) never
 get commitment variables, keeping the MIP small.
 
-**Horizon handling**: by default the whole horizon is one model with cyclic
-storage and free initial commitment. With `window_hours` set, the horizon
+**Horizon handling**: by default the whole horizon is one *cyclic* model —
+the hour before hour 0 is the last hour, for commitment logic, min up/down
+times, ramps and storage alike. With `window_hours` set, the horizon
 splits into sequential windows solved with `lookahead_hours` of extra
 foresight; commitment state, previous output (for ramps), unfinished min
 up/down obligations and storage SOC carry across boundaries, and the final

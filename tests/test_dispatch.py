@@ -52,6 +52,26 @@ def test_availability_derates_capacity():
     assert results.dispatch["expensive"].to_numpy() == pytest.approx([0.0, 30.0, 80.0, 0.0])
 
 
+def test_cyclic_ramp_links_first_and_last_hour():
+    """Monolithic windows wrap, so the last-hour output constrains hour 0."""
+    system = make_system(
+        [
+            gen("slow", "A", 10, 200, ramp=50),
+            gen("fast", "A", 100, 200),
+        ],
+        {"A": [50.0, 200.0, 200.0, 200.0, 200.0, 200.0]},
+    )
+    results = run(system, RunConfig())
+
+    # Hour 0 pins slow to 50 MW, and the wrap-around ramp caps the last
+    # hour at 100 MW even though demand there is 200 MW.
+    assert results.dispatch["slow"].to_numpy() == pytest.approx(
+        [50.0, 100.0, 150.0, 200.0, 150.0, 100.0]
+    )
+    p = results.dispatch["slow"]
+    assert abs(p.iloc[0] - p.iloc[-1]) <= 50 + 1e-6
+
+
 def test_unserved_energy_when_capacity_short():
     system = make_system([gen("only", "A", 10, 60)], {"A": [100.0] * 6})
     results = run(system, RunConfig(voll=5000.0))

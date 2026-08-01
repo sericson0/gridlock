@@ -1,7 +1,8 @@
 """Run driver: monolithic or rolling-horizon solves over the input horizon.
 
-Monolithic mode builds one model spanning every hour with cyclic storage
-and a free initial commitment state. Rolling mode splits the horizon into
+Monolithic mode builds one cyclic model spanning every hour: the hour
+before hour 0 is the last hour for commitment, ramp and storage
+constraints alike. Rolling mode splits the horizon into
 sequential windows (plus lookahead), carrying commitment state, output,
 min up/down obligations and storage state of charge between windows.
 """

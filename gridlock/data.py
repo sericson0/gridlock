@@ -7,7 +7,9 @@ Input files (see README for full column specifications):
 - ``node_locations.csv``        one row per node (name, latitude, longitude)
 - ``network.csv``               one row per line (pipe-and-bubble transport line)
 - ``demand.csv``                hourly MW demand, one column per node
-- ``availability_factors.csv``  hourly availability in [0, 1], one column per unit
+- ``availability_factors.csv``  hourly availability in [0, 1]; optional, and
+                                only units that need derating need a column
+                                (absent units are fully available)
 
 All validation lives here so the model builder can assume clean data.
 """
@@ -61,7 +63,9 @@ class SystemData:
 
     generators / storage / nodes / network are indexed by unit, unit, node
     and line name respectively. demand and availability are hourly frames
-    (row = hour, 0-based) whose columns cover every node / generator.
+    (row = hour, 0-based); demand's columns cover every node, while
+    availability holds only the units that have a profile — units without
+    a column are fully available.
     """
 
     generators: pd.DataFrame
@@ -88,13 +92,17 @@ def load_system(data_dir: str | Path) -> SystemData:
             raise FileNotFoundError(f"required input file not found: {path}")
         return pd.read_csv(path)
 
+    def read_optional(name: str) -> pd.DataFrame:
+        path = data_dir / name
+        return pd.read_csv(path) if path.is_file() else pd.DataFrame()
+
     return build_system(
         generators=read("generators.csv"),
         storage=read("storage.csv"),
         nodes=read("node_locations.csv"),
         network=read("network.csv"),
         demand=_strip_hour_column(read("demand.csv")),
-        availability=_strip_hour_column(read("availability_factors.csv")),
+        availability=_strip_hour_column(read_optional("availability_factors.csv")),
     )
 
 
@@ -295,6 +303,12 @@ def _prepare_demand(demand: pd.DataFrame, nodes: pd.DataFrame) -> pd.DataFrame:
 def _prepare_availability(
     availability: pd.DataFrame, generators: pd.DataFrame, num_hours: int
 ) -> pd.DataFrame:
+    """Validate whatever availability columns were provided.
+
+    Only provided columns are kept (in generator order): units without a
+    column are fully available and never materialized, so the frame — and
+    the input file — stays small or can be omitted entirely.
+    """
     availability = availability.copy().reset_index(drop=True)
     availability.columns = [str(c) for c in availability.columns]
     unknown = sorted(set(availability.columns) - set(generators.index))
@@ -302,16 +316,16 @@ def _prepare_availability(
         raise ValueError(
             f"availability_factors.csv has columns that are not known generators: {unknown}"
         )
+    if len(availability.columns) == 0:
+        return pd.DataFrame(index=pd.RangeIndex(num_hours))
     if len(availability) != num_hours:
         raise ValueError(
             "availability_factors.csv and demand.csv must cover the same hours "
             f"(got {len(availability)} vs {num_hours} rows)"
         )
 
-    # Units without an availability column are fully available.
-    availability = availability.reindex(
-        columns=list(generators.index), fill_value=1.0
-    ).astype(float)
+    ordered = [g for g in generators.index if g in availability.columns]
+    availability = availability[ordered].astype(float)
     if availability.isna().any().any():
         raise ValueError("availability_factors.csv contains missing values")
     if ((availability < -1e-9) | (availability > 1 + 1e-9)).any().any():

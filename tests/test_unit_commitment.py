@@ -44,17 +44,25 @@ def test_lp_relaxation_lower_bounds_mip():
     assert ((u > 1e-6) & (u < 1 - 1e-6)).iloc[:12].all()
 
 
-def assert_min_times_respected(results, unit, min_up, min_down):
-    """Every startup keeps the unit on for min_up hours (and vice versa)."""
+def assert_min_times_respected(results, unit, min_up, min_down, cyclic=False):
+    """Every startup keeps the unit on for min_up hours (and vice versa).
+
+    With ``cyclic`` (monolithic runs) obligations wrap: hours past the end
+    of the horizon are checked against the schedule's start.
+    """
     on = (results.commitment[unit] >= 0.5).astype(int).to_list()
     started = (results.startup[unit] >= 0.5).to_list()
     stopped = (results.shutdown[unit] >= 0.5).to_list()
     horizon = len(on)
+    if cyclic:
+        on, started, stopped = on * 2, started * 2, stopped * 2
     for t in range(horizon):
         if started[t]:
-            assert all(on[t : min(t + min_up, horizon)]), f"min up violated at {t}"
+            end = t + min_up if cyclic else min(t + min_up, horizon)
+            assert all(on[t:end]), f"min up violated at {t}"
         if stopped[t]:
-            assert not any(on[t : min(t + min_down, horizon)]), f"min down violated at {t}"
+            end = t + min_down if cyclic else min(t + min_down, horizon)
+            assert not any(on[t:end]), f"min down violated at {t}"
 
 
 def test_min_up_and_down_times():
@@ -68,10 +76,22 @@ def test_min_up_and_down_times():
     )
     results = run(system, RunConfig(unit_commitment=True))
 
-    assert_min_times_respected(results, "mid", min_up=4, min_down=4)
+    assert_min_times_respected(results, "mid", min_up=4, min_down=4, cyclic=True)
     # The unit is actually exercised: it turns on for the demand spikes.
     assert (results.commitment["mid"] >= 0.5).any()
     assert results.shed.to_numpy().sum() == pytest.approx(0.0)
+
+
+def test_cyclic_commitment_balances_startups_and_shutdowns():
+    """Monolithic windows wrap: a schedule that ends on and starts off pays
+    the wrap-around shutdown, so startups and shutdowns come in pairs."""
+    results = run(uc_system(), RunConfig(unit_commitment=True))
+
+    startups = results.startup["big"].sum()
+    shutdowns = results.shutdown["big"].sum()
+    assert startups == pytest.approx(shutdowns, abs=1e-6)
+    # The demand step forces exactly one on/off cycle.
+    assert startups == pytest.approx(1.0, abs=1e-6)
 
 
 def test_no_load_cost_paid_only_when_committed():

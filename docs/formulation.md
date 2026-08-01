@@ -4,6 +4,13 @@ gridlock solves a deterministic, hourly production cost problem. A model is
 built for one *window* of contiguous hours; a monolithic run is a single
 window over the whole horizon.
 
+Windows without carried initial state (monolithic runs) are **cyclic**:
+wherever a constraint references hour $t-1$, the hour before the first
+hour is the window's *last* hour. This applies uniformly to commitment
+logic, min up/down times, ramp limits and storage, so the year wraps
+around with no artificially free first hour. Rolling windows instead
+reference the state carried from the previous window.
+
 ## Sets
 
 | Symbol | Meaning |
@@ -24,7 +31,7 @@ their available capacity and get no commitment variables.
 | Symbol | Source | Meaning |
 |---|---|---|
 | $D_{n,t}$ | demand.csv | demand (MW) |
-| $A_{g,t}$ | availability_factors.csv | availability factor in $[0,1]$ |
+| $A_{g,t}$ | availability_factors.csv | availability factor in $[0,1]$; units without a column are fully available ($A_{g,t}=1$) |
 | $\overline{P}_g, \underline{P}_g$ | generators.csv | max / min stable output (MW) |
 | $c^{mc}_g$ | derived | marginal cost = fuel price × heat-rate slope + VOM ($/MWh) |
 | $c^{nl}_g$ | derived | no-load cost = fuel price × heat-rate intercept ($/hr) |
@@ -46,7 +53,6 @@ their available capacity and get no commitment variables.
 | $f^{+}_{\ell,t}, f^{-}_{\ell,t}$ | $[0,\ \overline{F}_\ell]$ | forward / reverse line flow (MW) |
 | $c_{s,t}, d_{s,t}$ | $[0,\ \overline{C}_s]$ | grid-side charge / discharge (MW) |
 | $e_{s,t}$ | $[0,\ \overline{E}_s]$ | state of charge (MWh) |
-| $e^{0}_{s}$ | $[0,\ \overline{E}_s]$ | free starting SOC (cyclic windows only) |
 | $\sigma_{n,t}$ | $[0,\ D_{n,t}]$ | unserved energy (MW) |
 
 ## Objective
@@ -94,9 +100,11 @@ $$
 u_{g,t} - u_{g,t-1} = v_{g,t} - w_{g,t}
 $$
 
-At the first hour of a window this references the carried initial state
-$u^0_g$; with no initial state (monolithic runs) the first hour is
-unconstrained, so hour one incurs no startup cost.
+At the first hour of a rolling window this references the carried initial
+state $u^0_g$. In cyclic (monolithic) windows $t-1$ wraps to the last
+hour, so a schedule that is off at the start but on at the end pays its
+wrap-around shutdown (and vice versa) — total startups equal total
+shutdowns over the cycle.
 
 ### Minimum up/down times ($g \in G^{UC}$, when $UT_g$ or $DT_g > 1$)
 
@@ -106,8 +114,12 @@ $$
 \sum_{\tau = t-DT_g+1}^{t} w_{g,\tau} \le 1 - u_{g,t}
 $$
 
-In rolling-horizon mode, a unit that enters a window with an unfinished
-up/down obligation has its first hours fixed to the inherited state.
+In cyclic windows the lookback sums wrap past the first hour into the end
+of the window (capped at the window length), so an obligation incurred
+near the end of the year binds the first hours as well. In rolling-horizon
+mode the lookback is truncated at the window start instead, and a unit
+that enters a window with an unfinished up/down obligation has its first
+hours fixed to the inherited state.
 
 ### Ramp limits (units with $R_g < \overline{P}_g$)
 
@@ -121,7 +133,8 @@ $$
 
 Units outside $G^{UC}$ use the plain form
 $|p_{g,t} - p_{g,t-1}| \le R_g$. First-hour ramps reference the carried
-previous output when a window inherits state.
+previous output when a window inherits state, and wrap to the last hour's
+output in cyclic windows.
 
 ### Storage (bathtub)
 
@@ -132,9 +145,10 @@ $$
 The round-trip efficiency is split evenly: $\eta_s = \sqrt{\eta^{rt}_s}$,
 applied once on the way in and once on the way out.
 
-**Cyclic (monolithic runs):** the first hour references the free variable
-$e^{0}_s$ and the last hour must return to it,
-$e_{s,\,t_{last}} = e^{0}_s$. No starting SOC input is needed — the
+**Cyclic (monolithic runs):** the first hour references the last hour's
+state of charge directly,
+$e_{s,\,t_{first}} = e_{s,\,t_{last}} + \eta_s c_{s,\,t_{first}} - d_{s,\,t_{first}}/\eta_s$,
+so the window ends where it began. No starting SOC input is needed — the
 optimizer chooses it, and cycling guarantees no free energy.
 
 **Rolling windows:** the first hour references the carried SOC. The first

@@ -13,7 +13,8 @@ def test_load_example_dataset(example_data_dir):
     assert len(system.generators) == 12
     assert len(system.storage) == 2
     assert len(system.network) == 3
-    # Availability is reindexed to cover every generator.
+    # The example provides a profile for every unit; columns follow
+    # generator order.
     assert list(system.availability.columns) == list(system.generators.index)
     # Derived economics exist and renewables need no commitment state.
     assert (system.generators["marginal_cost"] >= 0).all()
@@ -49,6 +50,17 @@ def test_availability_length_mismatch_rejected():
         )
 
 
-def test_missing_availability_defaults_to_one():
+def test_missing_availability_stays_unmaterialized():
+    """Units without a profile column get no column at all (implicitly 1.0)."""
+    system = make_system(
+        [gen("g1", "A", 10, 100), gen("g2", "A", 20, 100)],
+        {"A": [50] * 4},
+        availability={"g2": [1.0, 0.5, 1.0, 1.0]},
+    )
+    assert list(system.availability.columns) == ["g2"]
+
+
+def test_no_availability_input_at_all():
     system = make_system([gen("g1", "A", 10, 100)], {"A": [50] * 4})
-    assert (system.availability["g1"] == 1.0).all()
+    assert list(system.availability.columns) == []
+    assert len(system.availability) == 4
