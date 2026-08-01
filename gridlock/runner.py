@@ -17,13 +17,22 @@ import pandas as pd
 from .config import RunConfig
 from .data import SystemData
 from .model import InitialState, build_model
+from .profiling import model_stats
 from .results import compute_cost_summary, extract_window
 from .solver import SolveInfo, solve_model
 
 
 @dataclass
 class RunResults:
-    """Hourly result frames (rows = hours) plus solve statistics."""
+    """Hourly result frames (rows = hours) plus solve statistics.
+
+    ``window_stats`` has one row per solved window with build/solve/extract
+    timings, termination, objective/bound and every
+    :class:`~gridlock.profiling.SolveMetrics` field (problem size,
+    iterations, nodes, presolve detail in profile mode).
+    ``component_stats`` is a per-component size census of the first
+    window's Pyomo model (see :func:`gridlock.profiling.model_stats`).
+    """
 
     config: RunConfig
     dispatch: pd.DataFrame
@@ -39,6 +48,7 @@ class RunResults:
     window_stats: pd.DataFrame
     objective_value: float | None  # model objective (monolithic runs only)
     cost_summary: pd.Series = field(default=None)
+    component_stats: pd.DataFrame | None = None
 
     @property
     def total_cost(self) -> float:
@@ -51,6 +61,15 @@ class RunResults:
     @property
     def total_solve_seconds(self) -> float:
         return float(self.window_stats["solve_seconds"].sum())
+
+    @property
+    def total_highs_seconds(self) -> float:
+        """Pure HiGHS run time (excludes Pyomo -> HiGHS translation)."""
+        return float(self.window_stats["highs_run_seconds"].fillna(0.0).sum())
+
+    @property
+    def total_extract_seconds(self) -> float:
+        return float(self.window_stats["extract_seconds"].sum())
 
 
 def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
@@ -70,6 +89,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
     collected: list[dict[str, pd.DataFrame]] = []
     stats_rows: list[dict] = []
     state: InitialState | None = None
+    component_stats: pd.DataFrame | None = None
 
     for index, (hours, kept_hours) in enumerate(windows):
         initial = _initial_state_for_window(
@@ -80,24 +100,33 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         model = build_model(system, config, hours, initial)
         build_seconds = time.perf_counter() - build_start
 
-        info, duals = solve_model(model, config.solver, want_duals=want_duals)
+        if index == 0:
+            component_stats = model_stats(model)
+
+        info, duals = solve_model(
+            model, config.solver, want_duals=want_duals, profile=config.profile
+        )
         _warn_if_not_optimal(info, index)
 
+        extract_start = time.perf_counter()
         frames = extract_window(model, system, kept_hours, duals)
+        extract_seconds = time.perf_counter() - extract_start
         collected.append(frames)
-        stats_rows.append(
-            {
-                "window": index,
-                "first_hour": kept_hours[0],
-                "hours_kept": len(kept_hours),
-                "hours_modeled": len(hours),
-                "build_seconds": build_seconds,
-                "solve_seconds": info.solve_seconds,
-                "termination": info.termination,
-                "objective": info.objective,
-                "bound": info.bound,
-            }
-        )
+        row = {
+            "window": index,
+            "first_hour": kept_hours[0],
+            "hours_kept": len(kept_hours),
+            "hours_modeled": len(hours),
+            "build_seconds": build_seconds,
+            "solve_seconds": info.solve_seconds,
+            "translate_seconds": info.translate_seconds,
+            "extract_seconds": extract_seconds,
+            "termination": info.termination,
+            "objective": info.objective,
+            "bound": info.bound,
+        }
+        row.update(info.metrics.as_row())
+        stats_rows.append(row)
 
         if index < len(windows) - 1:
             state = _extract_state(system, frames, state)
@@ -120,6 +149,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         prices=prices,
         window_stats=pd.DataFrame(stats_rows),
         objective_value=stats_rows[0]["objective"] if monolithic else None,
+        component_stats=component_stats,
     )
     results.cost_summary = compute_cost_summary(system, results)
     return results

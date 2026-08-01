@@ -126,4 +126,6 @@ def write_results(results: "RunResults", output_dir: str | Path, system: SystemD
         output_dir / "generation_by_technology.csv"
     )
     results.window_stats.to_csv(output_dir / "window_stats.csv", index=False)
+    if results.component_stats is not None:
+        results.component_stats.to_csv(output_dir / "component_stats.csv")
     return output_dir

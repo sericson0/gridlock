@@ -3,6 +3,9 @@
 ``gridlock run``        solve a case and write result CSVs
 ``gridlock benchmark``  solve the same case under several HiGHS option
                         presets and compare runtimes
+``gridlock profile``    run the fixed benchmark suite and record profiling
+                        metrics to a JSONL file (see docs/profiling.md)
+``gridlock compare``    diff two profile record files case by case
 """
 
 from __future__ import annotations
@@ -14,6 +17,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from .bench import (
+    SUITES,
+    compare_files,
+    format_comparison,
+    get_suite,
+    run_suite,
+    summarize_records,
+)
 from .config import RunConfig, SolverSettings
 from .data import load_system
 from .results import generation_by_technology, write_results
@@ -38,6 +49,10 @@ def main(argv: list[str] | None = None) -> int:
         return _command_run(args)
     if args.command == "benchmark":
         return _command_benchmark(args)
+    if args.command == "profile":
+        return _command_profile(args)
+    if args.command == "compare":
+        return _command_compare(args)
     parser.print_help()
     return 2
 
@@ -68,6 +83,57 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     bench_parser.add_argument(
         "--output-csv", default=None, help="optional path to save the benchmark table"
+    )
+
+    profile_parser = subparsers.add_parser(
+        "profile",
+        help="run the fixed benchmark suite and record profiling metrics",
+    )
+    profile_parser.add_argument(
+        "--data-dir", default="data/example", help="input dataset (default: data/example)"
+    )
+    profile_parser.add_argument(
+        "--suite",
+        default="default",
+        choices=sorted(SUITES),
+        help="'default' = fast per-change suite; 'scale' = long horizon-scaling study",
+    )
+    profile_parser.add_argument(
+        "--cases",
+        default=None,
+        help="comma-separated case names (default: all in the suite; --list to see them)",
+    )
+    profile_parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="trials per case (default: 1; use 3+ when comparing changes)",
+    )
+    profile_parser.add_argument(
+        "--tag", default=None, help="label baked into the output filename and records"
+    )
+    profile_parser.add_argument(
+        "--output", default=None, help="output JSONL path (default: benchmarks/<stamp>_<tag>.jsonl)"
+    )
+    profile_parser.add_argument(
+        "--no-vary-seed",
+        action="store_true",
+        help="repeat trials with the same HiGHS random seed instead of varying it",
+    )
+    profile_parser.add_argument(
+        "--list", action="store_true", help="list suite cases and exit"
+    )
+
+    compare_parser = subparsers.add_parser(
+        "compare", help="compare two profile record files case by case"
+    )
+    compare_parser.add_argument("baseline", help="baseline JSONL file")
+    compare_parser.add_argument("candidate", help="candidate JSONL file")
+    compare_parser.add_argument(
+        "--time-metric",
+        default="highs_seconds",
+        choices=["highs_seconds", "solve_seconds", "wall_seconds", "build_seconds"],
+        help="headline timing to diff (default: highs_seconds — pure solver time)",
     )
     return parser
 
@@ -242,6 +308,50 @@ def _command_benchmark(args: argparse.Namespace) -> int:
         Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(args.output_csv, index=False)
         print(f"\nper-trial table written to {args.output_csv}")
+    return 0
+
+
+def _command_profile(args: argparse.Namespace) -> int:
+    suite = get_suite(args.suite)
+    if args.list:
+        for case in suite:
+            print(f"{case.name:20s} {case.description}")
+        return 0
+
+    if args.cases:
+        wanted = [name.strip() for name in args.cases.split(",") if name.strip()]
+        by_name = {case.name: case for case in suite}
+        unknown = [name for name in wanted if name not in by_name]
+        if unknown:
+            raise SystemExit(f"unknown cases: {unknown} (available: {list(by_name)})")
+        suite = [by_name[name] for name in wanted]
+
+    if args.repeat < 2:
+        print(
+            "profile: single trial per case — timing noise is unquantified; "
+            "prefer --repeat 3 when comparing changes\n"
+        )
+
+    records, output_path = run_suite(
+        data_dir=args.data_dir,
+        cases=suite,
+        repeats=args.repeat,
+        vary_seed=not args.no_vary_seed,
+        tag=args.tag,
+        output_path=args.output,
+    )
+    print(f"\n{summarize_records(records).to_string()}")
+    print(f"\nrecords written to {output_path}")
+    print(f"compare with: gridlock compare <baseline>.jsonl {output_path}")
+    return 0
+
+
+def _command_compare(args: argparse.Namespace) -> int:
+    comparison = compare_files(args.baseline, args.candidate, args.time_metric)
+    if comparison.empty:
+        print("no overlapping cases between the two files")
+        return 1
+    print(format_comparison(comparison))
     return 0
 
 
