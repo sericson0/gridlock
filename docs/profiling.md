@@ -96,6 +96,22 @@ the pre-presolve size to individual constraint blocks (`ramp_up`,
 **MIP quality:** `final_mip_gap`, `bound`, `primal_dual_integral`, and the
 presolve/solve/postsolve phase-time split.
 
+**Root-loop attribution** (`profile=True` MIP solves, HiGHS ≥ 1.15 log
+format). The UC MIP solves at the root node, so knowing *which part* of
+root processing is slow decides what to fix:
+
+| metric | meaning |
+|---|---|
+| `solve_main_mip_seconds` / `solve_submip_seconds` | solve-phase time in the main model vs the sub-MIP heuristics (RINS/RENS-style); `submip_calls` counts them |
+| `lp_iters_separation` / `lp_iters_heuristics` / `lp_iters_strong_branching` | LP iterations by purpose — "the cut loop is slow" and "the heuristics are slow" have entirely different fixes |
+| `first_feasible_seconds` / `first_feasible_objective` | when the first incumbent appeared and how good it was — the primal-side story |
+| `mip_restarts` | root restarts (each re-runs presolve on the cut-strengthened model) |
+| `final_cuts_in_lp` | cut rows still in the LP at the end |
+| `mip_timeline_json` | the progress table as JSON: bound/incumbent/gap/cuts/LP-iteration trajectory over time |
+
+On the example system the sub-MIP heuristics — not the cut loop — dominate
+the root: a warm start (below) removes exactly that cost.
+
 **Numerics:** matrix/cost/bound/RHS coefficient ranges from the log. If
 the cost range spans many orders of magnitude (VOLL vs small VOM values),
 slow or unstable LPs may be a scaling problem, not a formulation problem.
@@ -120,6 +136,45 @@ results = run(load_system("data/example"), RunConfig(profile=True, num_hours=168
 print(results.window_stats.T)       # every metric, one column per window
 print(results.component_stats)      # rows/vars per constraint block
 ```
+
+## Repeated solves of one model
+
+Experiments that solve the *same* model many times (option sweeps, warm
+starts) should not re-pay the Pyomo build and appsi translation each time —
+at annual scale the translation alone rivals the LP solve. `HighsSession`
+binds a model to a persistent solver interface; the first solve translates,
+later solves reuse:
+
+```python
+from gridlock.config import RunConfig, SolverSettings
+from gridlock.model import build_model
+from gridlock.solver import HighsSession
+
+model = build_model(system, RunConfig(), list(range(8760)))
+session = HighsSession(model)
+base, _ = session.solve(SolverSettings())                                # translates once
+ipm, _ = session.solve(SolverSettings(highs_options={"solver": "hipo"})) # pure solver time
+session.write_model("case.mps")   # export for Pyomo-free highspy experiments
+```
+
+Options are reset to HiGHS defaults between solves so settings can't leak
+from one experiment into the next. After a solve the model holds its
+solution, so `session.solve(..., warmstart=True)` re-starts from it.
+
+## Warm starts and the cyclic wrap
+
+Two `RunConfig` switches exist for root-node research on monolithic runs:
+
+- `warmstart_window_hours=N` (CLI `--warmstart-window N`): solve the
+  horizon in N-hour rolling windows first, then hand that solution to
+  HiGHS as a MIP start for the monolithic solve. This attacks the primal
+  side: at long horizons HiGHS's own heuristics fail to find a good
+  incumbent (the annual case times out at a ~53% gap with the *bound*
+  nearly converged). The pre-pass cost lands in `warmstart_seconds`.
+- `cyclic=False` (CLI `--no-cyclic`): drop the first-hour wrap rows from
+  commitment logic, min up/down and ramps, leaving the first hours free
+  exactly like a rolling run's first window (storage SOC stays cyclic).
+  Relaxing the wrap can only lower cost; measure what it buys the solver.
 
 ## How to read a comparison
 

@@ -9,10 +9,12 @@ min up/down obligations and storage state of charge between windows.
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 
 import pandas as pd
+import pyomo.environ as pyo
 
 from .config import RunConfig
 from .data import SystemData
@@ -86,6 +88,22 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
     # Duals (nodal prices) are only meaningful without binary variables.
     want_duals = not config.unit_commitment or not system.generators["needs_commitment"].any()
 
+    # Rolling pre-pass whose solution seeds the monolithic solve as a MIP
+    # start. Only meaningful when the main solve is a MIP.
+    warmstart_results: RunResults | None = None
+    warmstart_seconds: float | None = None
+    if (
+        monolithic
+        and config.warmstart_window_hours is not None
+        and config.unit_commitment
+    ):
+        pre_config = copy.deepcopy(config)
+        pre_config.warmstart_window_hours = None
+        pre_config.window_hours = config.warmstart_window_hours
+        pre_start = time.perf_counter()
+        warmstart_results = run(system, pre_config)
+        warmstart_seconds = time.perf_counter() - pre_start
+
     collected: list[dict[str, pd.DataFrame]] = []
     stats_rows: list[dict] = []
     state: InitialState | None = None
@@ -103,8 +121,16 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         if index == 0:
             component_stats = model_stats(model)
 
+        warm = warmstart_results is not None
+        if warm:
+            _seed_model_from_results(model, warmstart_results)
+
         info, duals = solve_model(
-            model, config.solver, want_duals=want_duals, profile=config.profile
+            model,
+            config.solver,
+            want_duals=want_duals,
+            profile=config.profile,
+            warmstart=warm,
         )
         _warn_if_not_optimal(info, index)
 
@@ -121,6 +147,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
             "solve_seconds": info.solve_seconds,
             "translate_seconds": info.translate_seconds,
             "extract_seconds": extract_seconds,
+            "warmstart_seconds": warmstart_seconds if warm else None,
             "termination": info.termination,
             "objective": info.objective,
             "bound": info.bound,
@@ -180,7 +207,13 @@ def _initial_state_for_window(
     monolithic: bool,
 ) -> InitialState | None:
     if monolithic:
-        return None  # free initial commitment, cyclic storage
+        if config.cyclic:
+            return None  # every time link wraps to the last hour
+        # An empty InitialState relaxes the wrap: commitment logic, min
+        # up/down and ramps leave the first hours free (exactly how a
+        # rolling run treats its first window) while storage SOC stays
+        # cyclic because no starting SOC is supplied.
+        return InitialState()
 
     energy = system.storage["energy_mwh"]
     if index == 0:
@@ -194,6 +227,50 @@ def _initial_state_for_window(
         # Don't let the final window drain storage below the year's start.
         state.min_terminal_soc = (config.initial_soc_fraction * energy).to_dict()
     return state
+
+
+def _seed_model_from_results(model: pyo.ConcreteModel, results: RunResults) -> None:
+    """Give *every* variable a value from a prior run's hourly frames.
+
+    appsi's warm start sends HiGHS a full solution vector in which any
+    variable still at None becomes 0.0 — a silent, usually infeasible
+    "start" — so completeness here is not optional. Binary commitment is
+    rounded hard to {0, 1}; continuous values are clamped to their sign
+    conventions so solver noise (-1e-9) can't leak in. Net line flows are
+    split into the forward/reverse pair (with losses, an optimal solution
+    never uses both directions at once, so the split is exact).
+    """
+
+    def seed(var, frame, transform):
+        for name in frame.columns:
+            values = frame[name]
+            for t in values.index:
+                var[name, t].set_value(transform(float(values.at[t])), skip_validation=True)
+
+    def clamp(x):
+        return max(0.0, x)
+
+    def unit_interval(x):
+        return min(1.0, max(0.0, x))
+
+    def to_binary(x):
+        return float(round(x))
+
+    seed(model.p, results.dispatch, clamp)
+    seed(model.u, results.commitment, to_binary)
+    seed(model.v, results.startup, unit_interval)
+    seed(model.w, results.shutdown, unit_interval)
+    seed(model.charge, results.storage_charge, clamp)
+    seed(model.discharge, results.storage_discharge, clamp)
+    seed(model.soc, results.storage_soc, clamp)
+    seed(model.shed, results.shed, clamp)
+
+    for line in model.L:
+        net = results.flows[line]
+        for t in net.index:
+            x = float(net.at[t])
+            model.flow_fwd[line, t].set_value(max(0.0, x), skip_validation=True)
+            model.flow_rev[line, t].set_value(max(0.0, -x), skip_validation=True)
 
 
 def _extract_state(

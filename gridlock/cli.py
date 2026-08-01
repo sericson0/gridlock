@@ -32,13 +32,26 @@ from .runner import run
 
 # HiGHS option presets for quick solver experiments. Anything HiGHS accepts
 # can also be passed ad hoc with --highs-option KEY=VALUE.
+#
+# Note "ipm" selects HiGHS's old IPX code, which loses badly to both
+# simplex and HiPO on this model class — measured 2026-08: the annual LP
+# took 35.5 s with simplex, 29 s with HiPO, and IPX/PDLP timed out at
+# 400 s. Use "hipo" for a modern interior-point comparison.
 BENCHMARK_PRESETS: dict[str, dict] = {
     "default": {},
     "presolve_off": {"presolve": "off"},
     "simplex": {"solver": "simplex"},
     "ipm": {"solver": "ipm"},
+    "hipo": {"solver": "hipo"},
+    "pdlp": {"solver": "pdlp"},
+    # MIP-root levers: solve the basis-less root LP with the HiPO interior
+    # point method (HiGHS >= 1.12), and heuristic-effort settings that
+    # target the incumbent problem at long horizons.
+    "mip_root_hipo": {"mip_lp_solver": "hipo"},
     "no_symmetry": {"mip_detect_symmetry": False},
     "heuristics_high": {"mip_heuristic_effort": 0.5},
+    "heuristics_max": {"mip_heuristic_effort": 0.9},
+    "no_restarts": {"mip_allow_restart": False},
 }
 
 
@@ -156,6 +169,22 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="rolling-horizon window length in hours (omit for one monolithic solve)",
     )
     parser.add_argument(
+        "--cyclic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="monolithic mode: wrap time-linked constraints from the first hour "
+        "back to the last (--no-cyclic leaves the first hours free instead; "
+        "storage SOC stays cyclic either way)",
+    )
+    parser.add_argument(
+        "--warmstart-window",
+        type=int,
+        default=None,
+        metavar="HOURS",
+        help="monolithic MIP only: first solve rolling windows of this many hours "
+        "and pass that solution to HiGHS as a MIP start",
+    )
+    parser.add_argument(
         "--lookahead", type=int, default=24, help="rolling-horizon lookahead hours (default: 24)"
     )
     parser.add_argument(
@@ -188,6 +217,8 @@ def _config_from_args(args: argparse.Namespace) -> RunConfig:
     return RunConfig(
         unit_commitment=args.uc,
         num_hours=args.hours,
+        cyclic=args.cyclic,
+        warmstart_window_hours=args.warmstart_window,
         window_hours=args.window,
         lookahead_hours=args.lookahead,
         initial_soc_fraction=args.initial_soc_fraction,

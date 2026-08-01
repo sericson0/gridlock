@@ -37,6 +37,12 @@ settings affect runtime, not a planning tool.
   coefficient ranges; a fixed benchmark suite writes tagged JSONL records
   and diffs them with noise- and correctness-aware comparisons
   (see [docs/profiling.md](docs/profiling.md))
+- **Root-node research tooling**: MIP-start warm starting from a rolling
+  pre-pass (`--warmstart-window`), an optional acyclic horizon
+  (`--no-cyclic`), root-loop attribution parsed from the HiGHS log
+  (cut-loop vs sub-MIP-heuristic time, incumbent trajectory), and a
+  persistent `HighsSession` so repeated solves of one model skip the
+  Pyomo→HiGHS translation
 
 ## Installation
 
@@ -64,6 +70,10 @@ gridlock run --data-dir data/example --uc --hours 168 --mip-gap 0.001
 
 # Full-year unit commitment via weekly rolling horizon
 gridlock run --data-dir data/example --uc --window 168 --lookahead 24 --mip-gap 0.005
+
+# Monolithic solve warm-started from a weekly rolling pre-pass (MIP start),
+# optionally without the cyclic first-hour wrap
+gridlock run --data-dir data/example --uc --hours 720 --warmstart-window 168 --no-cyclic
 
 # Compare HiGHS presets on the same case
 gridlock benchmark --data-dir data/example --no-uc --hours 336 \

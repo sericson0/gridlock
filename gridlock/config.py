@@ -52,6 +52,21 @@ class RunConfig:
     num_hours
         Truncate the input horizon to its first ``num_hours`` hours
         (None = use every hour in the input data). Handy for quick tests.
+    cyclic
+        Monolithic mode only. True (default): time-linked constraints wrap
+        the first hour back to the last (the hour before hour 0 is the
+        horizon's final hour). False: commitment logic, min up/down times
+        and ramps leave the first hours unconstrained instead — the same
+        free-initial-state treatment a rolling run gives its first window.
+        Storage SOC stays cyclic either way, so the horizon cannot end
+        with drained storage. Relaxing the wrap can only lower cost;
+        the point is to measure what the wrap rows cost the solver.
+    warmstart_window_hours
+        Monolithic mode only. If set, first solve the horizon in rolling
+        windows of this many hours (with ``lookahead_hours`` of lookahead),
+        then hand that solution to HiGHS as a MIP start for the monolithic
+        solve. Attacks the incumbent problem: at long horizons HiGHS's own
+        heuristics struggle to find a good feasible solution.
     window_hours
         None solves the whole horizon as one model (monolithic). An integer
         switches to rolling-horizon mode: the horizon is split into
@@ -78,6 +93,8 @@ class RunConfig:
 
     unit_commitment: bool = True
     num_hours: int | None = None
+    cyclic: bool = True
+    warmstart_window_hours: int | None = None
     window_hours: int | None = None
     lookahead_hours: int = 24
     initial_soc_fraction: float = 0.5
@@ -90,6 +107,14 @@ class RunConfig:
             raise ValueError("num_hours must be a positive integer")
         if self.window_hours is not None and self.window_hours < 1:
             raise ValueError("window_hours must be a positive integer")
+        if self.warmstart_window_hours is not None:
+            if self.warmstart_window_hours < 1:
+                raise ValueError("warmstart_window_hours must be a positive integer")
+            if self.window_hours is not None:
+                raise ValueError(
+                    "warmstart_window_hours only applies to monolithic runs "
+                    "(window_hours must be None)"
+                )
         if self.lookahead_hours < 0:
             raise ValueError("lookahead_hours must be non-negative")
         if not 0.0 <= self.initial_soc_fraction <= 1.0:
