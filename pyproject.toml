@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridlock"
+version = "0.1.0"
+description = "A small, modular electricity production cost model built on Pyomo and the appsi HiGHS interface"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "sericson0" }]
+keywords = ["power-systems", "production-cost-model", "unit-commitment", "pyomo", "highs"]
+dependencies = [
+    "pyomo>=6.7",
+    "highspy>=1.7",
+    "pandas>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+gridlock = "gridlock.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gridlock*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

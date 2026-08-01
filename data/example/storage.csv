@@ -1,0 +1,3 @@
+name,node,technology,power_mw,energy_mwh,roundtrip_efficiency
+battery_south,SOUTH,battery,250.0,1000.0,0.88
+pumped_north,NORTH,pumped_hydro,300.0,2400.0,0.76

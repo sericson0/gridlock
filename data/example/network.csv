@@ -1,0 +1,4 @@
+line,from_node,to_node,capacity_mw,loss_factor
+NORTH_SOUTH,NORTH,SOUTH,700.0,0.02
+SOUTH_EAST,SOUTH,EAST,500.0,0.025
+NORTH_EAST,NORTH,EAST,400.0,0.015
