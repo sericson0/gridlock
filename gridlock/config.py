@@ -69,6 +69,11 @@ class RunConfig:
     voll
         Value of lost load ($/MWh): penalty applied to unserved energy so the
         model stays feasible under scarcity.
+    profile
+        Capture and parse the HiGHS log of every solve, adding presolve
+        reductions, solve-phase timings and coefficient ranges to
+        ``RunResults.window_stats``. Basic metrics (problem size,
+        iterations, nodes, HiGHS run time) are collected regardless.
     """
 
     unit_commitment: bool = True
@@ -77,6 +82,7 @@ class RunConfig:
     lookahead_hours: int = 24
     initial_soc_fraction: float = 0.5
     voll: float = 10_000.0
+    profile: bool = False
     solver: SolverSettings = field(default_factory=SolverSettings)
 
     def validate(self) -> None:

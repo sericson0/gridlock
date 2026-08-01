@@ -31,6 +31,12 @@ settings affect runtime, not a planning tool.
   feasibility
 - A **benchmark command** that solves the same case under different HiGHS
   option presets and compares runtimes
+- A **profiling harness** (`gridlock profile` / `gridlock compare`): every
+  solve records problem size (pre- and post-presolve), simplex iterations,
+  MIP nodes and gap, a build/translate/solve/extract time split and
+  coefficient ranges; a fixed benchmark suite writes tagged JSONL records
+  and diffs them with noise- and correctness-aware comparisons
+  (see [docs/profiling.md](docs/profiling.md))
 
 ## Installation
 
@@ -63,6 +69,14 @@ gridlock run --data-dir data/example --uc --window 168 --lookahead 24 --mip-gap 
 gridlock benchmark --data-dir data/example --no-uc --hours 336 \
     --presets default,presolve_off,simplex,ipm
 
+# Record a performance baseline, then diff a code change against it
+gridlock profile --repeat 3 --tag baseline
+gridlock profile --repeat 3 --tag my-change
+gridlock compare benchmarks/<stamp>_baseline.jsonl benchmarks/<stamp>_my-change.jsonl
+
+# Horizon-scaling study: month / two months / quarter, monolithic vs rolling
+gridlock profile --suite scale --tag scale
+
 # Any raw HiGHS option can be passed through
 gridlock run --data-dir data/example --no-uc --hours 168 \
     --highs-option solver=ipm --highs-option run_crossover=off
@@ -91,7 +105,8 @@ results = run(system, config)
 
 print(results.cost_summary)          # $ by component
 print(results.dispatch)              # hourly MW per unit
-print(results.window_stats)          # build/solve seconds per window
+print(results.window_stats)          # per-window timings, sizes, iterations, nodes
+print(results.component_stats)       # constraint rows / variables per model block
 ```
 
 ## Input data
@@ -154,14 +169,17 @@ gridlock/
   config.py     RunConfig / SolverSettings (all run + solver options)
   data.py       CSV loading, validation, derived economics
   model.py      Pyomo model builder (one function per constraint block)
-  solver.py     appsi HiGHS wrapper (options passthrough, duals, timing)
+  solver.py     appsi HiGHS wrapper (options passthrough, duals, metrics)
+  profiling.py  solve metrics, HiGHS log parsing, model census, run records
+  bench.py      fixed benchmark suite, JSONL records, compare tooling
   runner.py     monolithic / rolling-horizon driver and state carrying
   results.py    frame extraction, cost accounting, CSV output
-  cli.py        `gridlock run` and `gridlock benchmark`
+  cli.py        `gridlock run|benchmark|profile|compare`
 data/example/   synthetic 3-node test system (seeded, reproducible)
+benchmarks/     profile records land here (gitignored)
 scripts/        example-data generator
 tests/          pytest suite on tiny analytic systems
-docs/           mathematical formulation
+docs/           mathematical formulation, profiling guide
 ```
 
 ## Tests
