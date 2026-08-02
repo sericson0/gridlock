@@ -48,7 +48,7 @@ their available capacity and get no commitment variables.
 | Symbol | Domain | Meaning |
 |---|---|---|
 | $p_{g,t}$ | $[0,\ \overline{P}_g A_{g,t}]$ | generation (MW) |
-| $u_{g,t}$ | $\{0,1\}$ or $[0,1]$ | committed (binary with unit commitment on; relaxed otherwise) |
+| $u_{g,t}$ | $\{0,1\}$ or $[0,1]$ | committed (binary with unit commitment on; relaxed otherwise). Clusters use $\{0,\dots,N_g\}$ — see below |
 | $v_{g,t}, w_{g,t}$ | $[0,1]$ | startup / shutdown indicators |
 | $f^{+}_{\ell,t}, f^{-}_{\ell,t}$ | $[0,\ \overline{F}_\ell]$ | forward / reverse line flow (MW) |
 | $c_{s,t}, d_{s,t}$ | $[0,\ \overline{C}_s]$ | grid-side charge / discharge (MW) |
@@ -94,6 +94,23 @@ may remain committed at reduced output, and a fully unavailable unit can
 stay "on" through an outage (producing nothing) rather than being forced
 through an artificial shutdown/startup cycle.
 
+**Tight variant** (`tight_generation_limits`). Writing $A_g = \overline{P}_g
+A_{g,t}$ for available capacity and $SU_g = SD_g = \min(\max(\underline{P}_g,
+R_g),\, A_g)$ for startup/shutdown capability, the upper bound becomes
+
+$$
+p_{g,t} \;\le\; A_g\, u_{g,t} - (A_g - SU_g)\, v_{g,t} - (A_g - SD_g)\, w_{g,t+1}
+$$
+
+which states that a unit starting in $t$ cannot exceed its startup
+capability there, and one shutting down in $t+1$ cannot exceed its
+shutdown capability in $t$. Both terms may apply at once only if the unit
+can start and stop in consecutive hours, so units with $UT_g = 1$ take the
+two terms as separate inequalities instead. The last hour of an acyclic
+window drops the $w_{g,t+1}$ term. This is the tight-and-compact
+formulation of Morales-España et al. (2013); with min up/down and ramping
+it yields the convex hull result of Gentile et al. (2017).
+
 ### Commitment logic ($g \in G^{UC}$)
 
 $$
@@ -136,6 +153,25 @@ $|p_{g,t} - p_{g,t-1}| \le R_g$. First-hour ramps reference the carried
 previous output when a window inherits state, and wrap to the last hour's
 output in cyclic windows.
 
+**Tight variant** (`tight_ramp_limits`). The two-period convex-hull
+inequalities of Damcı-Kurt et al. (2016), with $\underline{P}$ the
+minimum stable level valid across the step (the smaller of the two
+derated floors when an availability profile changes between them):
+
+$$
+p_{g,t} - p_{g,t-1} \le (\underline{P} + R_g) u_{g,t} - \underline{P}\, u_{g,t-1}
+  - (\underline{P} + R_g - SU_g) v_{g,t}
+$$
+
+$$
+p_{g,t-1} - p_{g,t} \le (\underline{P} + R_g) u_{g,t-1} - \underline{P}\, u_{g,t}
+  - (\underline{P} + R_g - SD_g) w_{g,t}
+$$
+
+Both forms give $SU_g$ in a startup hour and $R_g$ while running, but the
+tight one additionally states that a unit shutting down must fall by at
+least its minimum stable level, which the loose form leaves to a big-M.
+
 ### Storage (bathtub)
 
 $$
@@ -166,8 +202,34 @@ implicit curtailment.
 
 ## The unit commitment switch
 
-`RunConfig.unit_commitment` toggles only the domain of $u$: binary (MIP)
-versus $[0,1]$ (LP relaxation). Every constraint stays in the model, so the
-relaxation is a true lower bound of the MIP on identical structure — useful
-for isolating the integrality gap and for benchmarking solver settings on
-comparable problems.
+`RunConfig.unit_commitment` toggles only the domain of $u$: integral (MIP)
+versus continuous (LP relaxation). Every constraint stays in the model, so
+the relaxation is a true lower bound of the MIP on identical structure —
+useful for isolating the integrality gap and for benchmarking solver
+settings on comparable problems.
+
+## Clustered units
+
+A generator row may carry $N_g =$ `num_units` $> 1$, representing that many
+identical units at one node (`cluster_units` derives these automatically;
+see [profiling.md](profiling.md)). Every capacity and cost parameter stays
+*per unit* and the commitment variables become counts:
+
+$$
+u_{g,t} \in \{0, 1, \dots, N_g\}, \qquad v_{g,t}, w_{g,t} \in [0, N_g],
+\qquad p_{g,t} \in [0,\ N_g \overline{P}_g A_{g,t}]
+$$
+
+Every constraint above carries over unchanged except the minimum-down-time
+inequality, whose right-hand side counts the units *not* committed:
+
+$$
+\sum_{\tau = t-DT_g+1}^{t} w_{g,\tau} \le N_g - u_{g,t}
+$$
+
+With $N_g = 1$ this is exactly the unclustered model, and $u$ stays a plain
+binary. Clustering removes the permutation symmetry between interchangeable
+units (an $N!$-fold redundancy in the search space) at the cost of a mild
+relaxation: the pooled model can shift ramp capability between members that
+the unit-level model keeps separate, so clustered cost can fall marginally
+below unit-level cost.

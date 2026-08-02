@@ -17,7 +17,7 @@ import pandas as pd
 import pyomo.environ as pyo
 
 from .config import RunConfig
-from .data import SystemData
+from .data import SystemData, cluster_identical_units
 from .model import InitialState, build_model
 from .profiling import model_stats
 from .results import compute_cost_summary, extract_window
@@ -34,6 +34,10 @@ class RunResults:
     iterations, nodes, presolve detail in profile mode).
     ``component_stats`` is a per-component size census of the first
     window's Pyomo model (see :func:`gridlock.profiling.model_stats`).
+    ``system`` is the system as actually modeled — the same object that
+    was passed in, unless ``config.cluster_units`` pooled its generators,
+    in which case result columns carry the *cluster* names and this is the
+    frame that describes them.
     """
 
     config: RunConfig
@@ -51,6 +55,7 @@ class RunResults:
     objective_value: float | None  # model objective (monolithic runs only)
     cost_summary: pd.Series = field(default=None)
     component_stats: pd.DataFrame | None = None
+    system: SystemData | None = None
 
     @property
     def total_cost(self) -> float:
@@ -79,6 +84,9 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
     config = config or RunConfig()
     config.validate()
 
+    if config.cluster_units:
+        system = cluster_identical_units(system)
+
     total_hours = system.num_hours
     if config.num_hours is not None:
         total_hours = min(total_hours, config.num_hours)
@@ -100,6 +108,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         pre_config = copy.deepcopy(config)
         pre_config.warmstart_window_hours = None
         pre_config.window_hours = config.warmstart_window_hours
+        pre_config.cluster_units = False  # `system` is already clustered
         pre_start = time.perf_counter()
         warmstart_results = run(system, pre_config)
         warmstart_seconds = time.perf_counter() - pre_start
@@ -177,6 +186,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         window_stats=pd.DataFrame(stats_rows),
         objective_value=stats_rows[0]["objective"] if monolithic else None,
         component_stats=component_stats,
+        system=system,
     )
     results.cost_summary = compute_cost_summary(system, results)
     return results
@@ -234,8 +244,8 @@ def _seed_model_from_results(model: pyo.ConcreteModel, results: RunResults) -> N
 
     appsi's warm start sends HiGHS a full solution vector in which any
     variable still at None becomes 0.0 — a silent, usually infeasible
-    "start" — so completeness here is not optional. Binary commitment is
-    rounded hard to {0, 1}; continuous values are clamped to their sign
+    "start" — so completeness here is not optional. Commitment is rounded
+    to a whole count; continuous values are clamped to their sign
     conventions so solver noise (-1e-9) can't leak in. Net line flows are
     split into the forward/reverse pair (with losses, an optimal solution
     never uses both directions at once, so the split is exact).
@@ -253,11 +263,11 @@ def _seed_model_from_results(model: pyo.ConcreteModel, results: RunResults) -> N
     def unit_interval(x):
         return min(1.0, max(0.0, x))
 
-    def to_binary(x):
+    def to_count(x):
         return float(round(x))
 
     seed(model.p, results.dispatch, clamp)
-    seed(model.u, results.commitment, to_binary)
+    seed(model.u, results.commitment, to_count)
     seed(model.v, results.startup, unit_interval)
     seed(model.w, results.shutdown, unit_interval)
     seed(model.charge, results.storage_charge, clamp)
@@ -279,14 +289,15 @@ def _extract_state(
     previous: InitialState | None,
 ) -> InitialState:
     """Build the InitialState for the next window from this window's kept hours."""
-    commitment_frame = frames["commitment"]
-    on_off = (commitment_frame >= 0.5).astype(int)  # robust to LP-relaxed values
+    # Round rather than threshold: a cluster carries a committed *count*,
+    # and LP-relaxed runs carry fractional values that must land on one.
+    on_off = frames["commitment"].round().astype(int)
 
     state_hours = {}
     for g in on_off.columns:
         series = on_off[g].to_list()
         run_length = _trailing_run_length(series)
-        is_on = series[-1] == 1
+        is_on = series[-1] > 0
         # If the whole window shares one state, extend the previous count.
         if run_length == len(series) and previous is not None and previous.state_hours:
             prior = previous.state_hours.get(g, 0)

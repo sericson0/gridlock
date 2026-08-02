@@ -67,6 +67,30 @@ class RunConfig:
         then hand that solution to HiGHS as a MIP start for the monolithic
         solve. Attacks the incumbent problem: at long horizons HiGHS's own
         heuristics struggle to find a good feasible solution.
+    tight_generation_limits
+        Replace ``p <= available * u`` with the startup/shutdown-aware
+        upper bound ``p <= available*u - (available-SU)*v - (available-SD)*w'``
+        (Morales-España et al. 2013; Gentile et al. 2017). Same variables,
+        strictly tighter LP relaxation. Units with a one-hour minimum up
+        time get the startup and shutdown terms as two separate rows,
+        because a unit that starts and stops in consecutive hours would
+        otherwise be over-constrained.
+    tight_ramp_limits
+        Replace the ramp rows with the two-period convex-hull inequalities
+        of Damcı-Kurt et al. (Math. Prog. 158, 2016), which subtract the
+        minimum stable level on the *other* side of the step instead of
+        leaving the shutdown case to a loose big-M.
+
+    cluster_units
+        Pool identical generators into integer-commitment clusters before
+        building (see :func:`gridlock.data.cluster_identical_units`). This
+        removes the permutation symmetry between interchangeable units and
+        shrinks the model; because a cluster can shift ramp capability
+        between its members it is a slight relaxation, so cost can come in
+        marginally below the unit-level model's.
+
+    The tightening and clustering switches default to False so recorded
+    baselines stay comparable; turn them on to measure what they buy.
     window_hours
         None solves the whole horizon as one model (monolithic). An integer
         switches to rolling-horizon mode: the horizon is split into
@@ -95,6 +119,9 @@ class RunConfig:
     num_hours: int | None = None
     cyclic: bool = True
     warmstart_window_hours: int | None = None
+    tight_generation_limits: bool = False
+    tight_ramp_limits: bool = False
+    cluster_units: bool = False
     window_hours: int | None = None
     lookahead_hours: int = 24
     initial_soc_fraction: float = 0.5

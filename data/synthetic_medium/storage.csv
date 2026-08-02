@@ -1,0 +1,6 @@
+name,node,technology,power_mw,energy_mwh,roundtrip_efficiency
+battery_Z00,Z00,battery,200.0,800.0,0.88
+battery_Z01,Z01,battery,200.0,800.0,0.88
+battery_Z02,Z02,battery,200.0,800.0,0.88
+battery_Z03,Z03,battery,200.0,800.0,0.88
+battery_Z04,Z04,battery,200.0,800.0,0.88

@@ -45,6 +45,22 @@ gridlock profile --suite scale --tag baseline-scale
 gridlock profile --suite scale --cases uc_month_mono --repeat 3   # one case, 3 trials
 ```
 
+### The formulation suite
+
+`--suite formulation` holds the horizon fixed (168 h, 0.5% gap) and varies
+the *model* instead: baseline, each tightening alone, both together, and
+integer clustering with and without them.
+
+```bash
+gridlock profile --suite formulation --repeat 3 --tag tightness
+```
+
+Because the tightenings are valid reformulations, `gridlock compare`'s
+cost check doubles as the correctness gate: costs that disagree by more
+than the gap mean the reformulation changed the answer. Clustering only
+bites on a system that actually contains interchangeable units — pair it
+with `--data-dir` pointing at a `scripts/make_large_data.py` system.
+
 This answers the decomposition question the model exists to study: how
 fast does monolithic UC degrade as the horizon grows, and where does
 rolling overtake it? Monolithic cases carry a 30-minute per-solve cap;
@@ -160,6 +176,37 @@ session.write_model("case.mps")   # export for Pyomo-free highspy experiments
 Options are reset to HiGHS defaults between solves so settings can't leak
 from one experiment into the next. After a solve the model holds its
 solution, so `session.solve(..., warmstart=True)` re-starts from it.
+
+## Formulation variants
+
+Three `RunConfig` switches change the *model* rather than the solve, all
+defaulting to off so recorded baselines stay comparable:
+
+| switch | CLI | what it changes |
+|---|---|---|
+| `tight_generation_limits` | `--tight-generation-limits` | output upper bound charges for startup/shutdown: `p ≤ A·u − (A−SU)·v − (A−SD)·w′` (Morales-España et al. 2013; Gentile et al. 2017). Units with a one-hour minimum up time get the two terms as separate rows |
+| `tight_ramp_limits` | `--tight-ramp-limits` | two-period convex-hull ramp inequalities (Damcı-Kurt et al. 2016), which subtract the minimum stable level on the other side of the step instead of leaving the shutdown case to a big-M |
+| `cluster_units` | `--cluster-units` | pools identical generators into integer-commitment clusters (Palmintier & Webster 2014), removing permutation symmetry |
+
+`--tight` is shorthand for both tightenings. The first two are *valid*
+reformulations: they change the LP relaxation, never the set of
+integer-feasible schedules, so a cost difference beyond solver tolerance
+is a bug (the test suite asserts this under derating, rolling windows and
+acyclic horizons alike). Clustering is a mild *relaxation* — a cluster can
+shift ramp capability between its members — so its cost may come in
+marginally below the unit-level model's.
+
+Because clustering renames generators, `RunResults.system` carries the
+system as actually modeled; use it rather than the input when interpreting
+result columns.
+
+To study size scaling rather than horizon scaling, generate a bigger
+system whose thermal fleet contains genuinely interchangeable units:
+
+```bash
+python scripts/make_large_data.py --preset large     # 10 zones, 3 copies per archetype
+gridlock run --data-dir data/synthetic_large --uc --hours 168 --cluster-units --tight
+```
 
 ## Warm starts and the cyclic wrap
 

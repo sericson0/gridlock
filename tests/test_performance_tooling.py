@@ -131,6 +131,43 @@ def test_session_resolves_and_isolates_options():
     assert after.objective == pytest.approx(first.objective, rel=1e-6)
 
 
+def test_session_reports_per_solve_run_time_not_a_cumulative_clock():
+    """HiGHS's getRunTime() accumulates over an instance's life.
+
+    Left raw it makes every re-solve look slower than the last, which
+    silently inverts option sweeps. The session must report each solve's
+    own time.
+    """
+    system = uc_system()
+    model = build_model(system, RunConfig(unit_commitment=True), list(range(24)))
+    session = HighsSession(model)
+
+    first, _ = session.solve()
+    second, _ = session.solve()
+
+    # A warm re-solve is cheaper, and each reading must stay within its
+    # own wall-clock measurement rather than growing without bound.
+    assert second.metrics.highs_run_seconds <= first.metrics.highs_run_seconds
+    for info in (first, second):
+        assert info.metrics.highs_run_seconds <= info.solve_seconds + 1e-6
+
+
+def test_cold_solve_discards_retained_solver_state():
+    system = uc_system()
+    model = build_model(system, RunConfig(unit_commitment=True), list(range(24)))
+    session = HighsSession(model)
+
+    first, _ = session.solve()
+    warm, _ = session.solve()
+    cold, _ = session.solve(cold=True)
+
+    # Warm re-solves inherit the basis and incumbent; a cold one repeats
+    # the original work, so its iteration count returns to the first solve's.
+    assert warm.metrics.simplex_iterations < first.metrics.simplex_iterations
+    assert cold.metrics.simplex_iterations == first.metrics.simplex_iterations
+    assert cold.objective == pytest.approx(first.objective, rel=1e-6)
+
+
 def test_session_writes_model_file(tmp_path):
     system = uc_system()
     model = build_model(system, RunConfig(unit_commitment=True), list(range(24)))

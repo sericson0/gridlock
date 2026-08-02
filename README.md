@@ -17,6 +17,10 @@ settings affect runtime, not a planning tool.
   against its relaxation on identical structure
 - Commitment detail: minimum stable levels, startup/shutdown costs, no-load
   (heat-rate intercept) costs, ramp limits, minimum up/down times
+- **Formulation variants** for tightness research: startup/shutdown-aware
+  generation limits and two-period convex-hull ramp inequalities
+  (`--tight`), plus integer clustering of identical units
+  (`--cluster-units`) to remove permutation symmetry
 - **Storage** as a bathtub state-of-charge model with round-trip efficiency;
   cyclic over the horizon (ending SOC = starting SOC, with the starting
   level a free decision variable)
@@ -187,7 +191,7 @@ gridlock/
   cli.py        `gridlock run|benchmark|profile|compare`
 data/example/   synthetic 3-node test system (seeded, reproducible)
 benchmarks/     profile records land here (gitignored)
-scripts/        example-data generator
+scripts/        example-data generator; make_large_data.py for size scaling
 tests/          pytest suite on tiny analytic systems
 docs/           mathematical formulation, profiling guide
 ```
