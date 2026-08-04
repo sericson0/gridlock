@@ -27,6 +27,15 @@ from .profiling import (
     parse_highs_log,
     parse_mip_progress,
 )
+from .heuristics import (
+    CommitmentGuess,
+    build_guess,
+    lp_relaxation_guess,
+    merit_order,
+    net_load_mw,
+    priority_list_guess,
+    similar_days_guess,
+)
 from .runner import RunResults, run
 from .solver import HighsSession, SolveInfo, solve_model
 
@@ -41,6 +50,13 @@ __all__ = [
     "cluster_identical_units",
     "InitialState",
     "build_model",
+    "CommitmentGuess",
+    "build_guess",
+    "net_load_mw",
+    "merit_order",
+    "priority_list_guess",
+    "similar_days_guess",
+    "lp_relaxation_guess",
     "RunResults",
     "run",
     "SolveInfo",

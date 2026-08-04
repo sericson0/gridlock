@@ -88,6 +88,22 @@ class RunConfig:
         shrinks the model; because a cluster can shift ramp capability
         between its members it is a slight relaxation, so cost can come in
         marginally below the unit-level model's.
+    heuristic
+        Monolithic MIP only. Guess the commitment schedule from domain
+        structure before solving: 'priority' (dispatch-curve stacking
+        against net load), 'similar_days' (representative-day schedules
+        transferred to lookalike days), or 'lp' (round the LP relaxation).
+        The guess is completed into a full solution and handed to HiGHS as
+        a MIP start. See gridlock/heuristics.py.
+    heuristic_fixing
+        How hard to lean on the guess: 'off' (warm start only — exact),
+        'screen' (also fix the entries the heuristic is confident about),
+        'aggressive' (fix everything — fastest, quality bounded by the
+        guess). Only meaningful with ``heuristic`` set.
+    heuristic_options
+        Keyword overrides passed to the guess builder (e.g.
+        ``{"reserve_margin": 0.1}`` for 'priority',
+        ``{"num_representatives": 6}`` for 'similar_days').
 
     The tightening and clustering switches default to False so recorded
     baselines stay comparable; turn them on to measure what they buy.
@@ -122,6 +138,9 @@ class RunConfig:
     tight_generation_limits: bool = False
     tight_ramp_limits: bool = False
     cluster_units: bool = False
+    heuristic: str | None = None
+    heuristic_fixing: str = "off"
+    heuristic_options: dict = field(default_factory=dict)
     window_hours: int | None = None
     lookahead_hours: int = 24
     initial_soc_fraction: float = 0.5
@@ -142,6 +161,24 @@ class RunConfig:
                     "warmstart_window_hours only applies to monolithic runs "
                     "(window_hours must be None)"
                 )
+        if self.heuristic is not None:
+            if self.heuristic not in ("priority", "similar_days", "lp"):
+                raise ValueError(
+                    f"unknown heuristic '{self.heuristic}' "
+                    "(available: priority, similar_days, lp)"
+                )
+            if self.window_hours is not None:
+                raise ValueError("heuristic only applies to monolithic runs")
+            if self.warmstart_window_hours is not None:
+                raise ValueError(
+                    "heuristic and warmstart_window_hours are alternative "
+                    "warm-start sources; set only one"
+                )
+        if self.heuristic_fixing not in ("off", "screen", "aggressive"):
+            raise ValueError(
+                f"unknown heuristic_fixing '{self.heuristic_fixing}' "
+                "(available: off, screen, aggressive)"
+            )
         if self.lookahead_hours < 0:
             raise ValueError("lookahead_hours must be non-negative")
         if not 0.0 <= self.initial_soc_fraction <= 1.0:

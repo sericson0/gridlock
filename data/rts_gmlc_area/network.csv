@@ -1,0 +1,5 @@
+line,from_node,to_node,capacity_mw,loss_factor
+Area_1__Area_2,Area_1,Area_2,1175,0.01
+Area_1__Area_3,Area_1,Area_3,100,0.01
+Area_3__Area_1,Area_3,Area_1,500,0.01
+Area_3__Area_2,Area_3,Area_2,500,0.01

@@ -21,6 +21,11 @@ settings affect runtime, not a planning tool.
   generation limits and two-period convex-hull ramp inequalities
   (`--tight`), plus integer clustering of identical units
   (`--cluster-units`) to remove permutation symmetry
+- **Domain heuristics** (`--heuristic priority|similar_days|lp`): guess
+  the commitment schedule from merit order and net load, transfer
+  schedules between similar days, or round the LP relaxation — delivered
+  as a MIP start, optionally fixing high-confidence commitments
+  (`--heuristic-fixing screen`)
 - **Storage** as a bathtub state-of-charge model with round-trip efficiency;
   cyclic over the horizon (ending SOC = starting SOC, with the starting
   level a free decision variable)
@@ -64,6 +69,19 @@ solver install.
 A synthetic 3-node, 12-generator, 2-storage test system ships in
 [data/example/](data/example/) (regenerate with
 [scripts/make_example_data.py](scripts/make_example_data.py)).
+
+For real systems, fetch and convert **RTS-GMLC** (73 thermal units) or
+**NREL-118** (192 thermal units), each a full 8784-hour year:
+
+```bash
+python scripts/fetch_external_data.py
+python scripts/import_rts_gmlc.py --aggregate area
+python scripts/import_nrel118.py --aggregate region
+```
+
+See [docs/profiling.md](docs/profiling.md) for the conversion caveats and
+the licensing difference between the two (RTS-GMLC is redistributable;
+NREL-118 is not).
 
 ```bash
 # One week, LP relaxation, monolithic
@@ -190,8 +208,9 @@ gridlock/
   results.py    frame extraction, cost accounting, CSV output
   cli.py        `gridlock run|benchmark|profile|compare`
 data/example/   synthetic 3-node test system (seeded, reproducible)
+data/external/  third-party datasets cloned on demand (gitignored)
 benchmarks/     profile records land here (gitignored)
-scripts/        example-data generator; make_large_data.py for size scaling
+scripts/        example-data generators; RTS-GMLC / NREL-118 importers
 tests/          pytest suite on tiny analytic systems
 docs/           mathematical formulation, profiling guide
 ```

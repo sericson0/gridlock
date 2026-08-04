@@ -20,6 +20,10 @@ env/
 results/
 benchmarks/
 
+# Third-party datasets cloned by scripts/fetch_external_data.py. Large, and
+# redistributing them here would inherit their licenses (see the script).
+data/external/
+
 # Editors / OS
 .vscode/
 .idea/

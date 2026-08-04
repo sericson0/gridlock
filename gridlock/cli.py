@@ -207,6 +207,20 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "(removes permutation symmetry; slightly relaxes ramp coupling)",
     )
     parser.add_argument(
+        "--heuristic",
+        choices=["priority", "similar_days", "lp"],
+        default=None,
+        help="monolithic MIP only: guess the commitment schedule from domain "
+        "structure and hand it to HiGHS as a MIP start",
+    )
+    parser.add_argument(
+        "--heuristic-fixing",
+        choices=["off", "screen", "aggressive"],
+        default="off",
+        help="how hard to lean on the guess: warm start only (off), also fix "
+        "confident entries (screen), or fix everything (aggressive)",
+    )
+    parser.add_argument(
         "--lookahead", type=int, default=24, help="rolling-horizon lookahead hours (default: 24)"
     )
     parser.add_argument(
@@ -244,6 +258,8 @@ def _config_from_args(args: argparse.Namespace) -> RunConfig:
         tight_generation_limits=args.tight or args.tight_generation_limits,
         tight_ramp_limits=args.tight or args.tight_ramp_limits,
         cluster_units=args.cluster_units,
+        heuristic=args.heuristic,
+        heuristic_fixing=args.heuristic_fixing,
         window_hours=args.window,
         lookahead_hours=args.lookahead,
         initial_soc_fraction=args.initial_soc_fraction,

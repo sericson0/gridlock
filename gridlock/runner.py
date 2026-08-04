@@ -18,10 +18,11 @@ import pyomo.environ as pyo
 
 from .config import RunConfig
 from .data import SystemData, cluster_identical_units
+from .heuristics import apply_fixing, build_guess, complete_solution, match_fraction
 from .model import InitialState, build_model
 from .profiling import model_stats
 from .results import compute_cost_summary, extract_window
-from .solver import SolveInfo, solve_model
+from .solver import HighsSession, SolveInfo, solve_model
 
 
 @dataclass
@@ -113,6 +114,14 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         warmstart_results = run(system, pre_config)
         warmstart_seconds = time.perf_counter() - pre_start
 
+    # Domain-heuristic commitment guess (see gridlock/heuristics.py):
+    # built once here, completed against the model inside the loop.
+    guess = None
+    if monolithic and config.heuristic is not None and config.unit_commitment:
+        guess_start = time.perf_counter()
+        guess = build_guess(system, config, list(range(total_hours)))
+        guess_seconds = time.perf_counter() - guess_start
+
     collected: list[dict[str, pd.DataFrame]] = []
     stats_rows: list[dict] = []
     state: InitialState | None = None
@@ -134,13 +143,60 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         if warm:
             _seed_model_from_results(model, warmstart_results)
 
-        info, duals = solve_model(
-            model,
-            config.solver,
-            want_duals=want_duals,
-            profile=config.profile,
-            warmstart=warm,
-        )
+        heuristic_seconds = heuristic_fallback = heuristic_fixed = None
+        session = None
+        if guess is not None:
+            # One session serves completion and main solve, so the model is
+            # translated once and the unfixing arrives as an incremental
+            # update — at annual scale translation rivals the LP solve.
+            session = HighsSession(model)
+            completion_start = time.perf_counter()
+            _, heuristic_fallback = complete_solution(model, guess, session=session)
+            heuristic_fixed = apply_fixing(model, guess, config.heuristic_fixing)
+            heuristic_seconds = (
+                guess_seconds + time.perf_counter() - completion_start
+            )
+            if heuristic_fallback:
+                print(
+                    f"note: heuristic '{guess.name}' over-committed; completion "
+                    "relaxed minimum-output rows (warm start may be rejected)"
+                )
+
+        if session is not None:
+            try:
+                info, duals = session.solve(
+                    config.solver,
+                    want_duals=want_duals,
+                    profile=config.profile,
+                    warmstart=True,
+                )
+            except RuntimeError:
+                # Fixing can over-constrain the model into infeasibility.
+                # Losing the run to a heuristic would be worse than losing
+                # the speedup, so unfix and solve as a plain warm start.
+                if not heuristic_fixed:
+                    raise
+                print(
+                    f"warning: heuristic '{guess.name}' fixing left no feasible "
+                    "solution; retrying as warm start only"
+                )
+                for var in model.u.values():
+                    var.unfix()
+                heuristic_fixed = 0
+                info, duals = session.solve(
+                    config.solver,
+                    want_duals=want_duals,
+                    profile=config.profile,
+                    warmstart=True,
+                )
+        else:
+            info, duals = solve_model(
+                model,
+                config.solver,
+                want_duals=want_duals,
+                profile=config.profile,
+                warmstart=warm,
+            )
         _warn_if_not_optimal(info, index)
 
         extract_start = time.perf_counter()
@@ -157,6 +213,12 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
             "translate_seconds": info.translate_seconds,
             "extract_seconds": extract_seconds,
             "warmstart_seconds": warmstart_seconds if warm else None,
+            "heuristic_seconds": heuristic_seconds,
+            "heuristic_fixed_vars": heuristic_fixed,
+            "heuristic_fallback": heuristic_fallback,
+            "heuristic_match_pct": (
+                None if guess is None else match_fraction(model, guess)
+            ),
             "termination": info.termination,
             "objective": info.objective,
             "bound": info.bound,

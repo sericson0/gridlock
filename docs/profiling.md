@@ -45,6 +45,54 @@ gridlock profile --suite scale --tag baseline-scale
 gridlock profile --suite scale --cases uc_month_mono --repeat 3   # one case, 3 trials
 ```
 
+## Real test systems
+
+The synthetic systems are reproducible but small and, being generated,
+can't exhibit the parameter spread real fleets have. Two public datasets
+convert into gridlock's schema:
+
+```bash
+python scripts/fetch_external_data.py          # clone into data/external/ (gitignored)
+python scripts/import_rts_gmlc.py --aggregate area   # 3 nodes,  73 thermal units
+python scripts/import_rts_gmlc.py                    # 73 nodes, 73 thermal units
+python scripts/import_nrel118.py --aggregate region  # 3 nodes,  192 thermal units
+python scripts/import_nrel118.py                     # 118 nodes, 192 thermal units
+```
+
+| dataset | nodes | lines | thermal | hours | day at 1% gap |
+|---|---|---|---|---|---|
+| `rts_gmlc_area` | 3 | 4 | 73 | 8784 | ~3 s |
+| `rts_gmlc` | 73 | 121 | 73 | 8784 | ~10 s |
+| `nrel118_region` | 3 | 3 | 192 | 8784 | ~7 s |
+| `nrel118` | 118 | 186 | 192 | 8784 | **>600 s** |
+
+The nodal NREL-118 case is far harder than anything else here — a single
+day does not close a 1% gap in ten minutes — which makes it the natural
+stress case now that the synthetic systems are solved in seconds.
+
+**Licensing.** RTS-GMLC carries an explicit NREL grant permitting
+redistribution with its notice attached. The NREL-118 mirror carries **no
+license at all**, so treat converted NREL-118 data as local-only. Each
+import writes a `PROVENANCE.md` recording this alongside every conversion
+decision.
+
+Three conversion caveats worth knowing before drawing conclusions:
+
+- **Line ratings are DC-power-flow thermal limits.** gridlock ignores
+  Kirchhoff's voltage law, so the nodal variants let flow route around
+  congestion in ways the real system cannot, and cost comes out
+  optimistically low. The `--aggregate` variants collapse to areas joined
+  by summed tie capacities, which *is* an honest transport model.
+- **Heat rates are collapsed** from piecewise curves to slope + intercept
+  by a min-to-max secant. RTS-GMLC averages 3.2% fuel-input error (worst
+  11.1%); NREL-118 averages 0.75% and is *exact* for 101 of 192 units,
+  because it publishes a genuine no-load term. Both importers name the
+  units they approximate.
+- **Ramp limits may not bind.** RTS-GMLC ramp rates converted at face
+  value leave almost no unit ramp-limited over an hour, so the ramp
+  constraints — and the tight ramp inequalities — go untested. PGLIB-UC
+  divides these by 3 for exactly this reason.
+
 ### The formulation suite
 
 `--suite formulation` holds the horizon fixed (168 h, 0.5% gap) and varies
@@ -206,6 +254,69 @@ system whose thermal fleet contains genuinely interchangeable units:
 ```bash
 python scripts/make_large_data.py --preset large     # 10 zones, 3 copies per archetype
 gridlock run --data-dir data/synthetic_large --uc --hours 168 --cluster-units --tight
+```
+
+## Domain heuristics
+
+The variable anatomy of this model (see the memory notes from 2026-08)
+shows the optimal schedule's information content is tiny: on a 52-unit
+week, 8 startups/shutdowns hiding in 8,736 binaries, with which units are
+"hard" predictable from merit-order position. `gridlock/heuristics.py`
+exploits that: guess the commitment schedule from domain structure, then
+hand it to HiGHS.
+
+| `--heuristic` | idea | cost of the guess |
+|---|---|---|
+| `priority` | rank units by all-in cost, stack against hourly net load (demand − renewables, storage-smoothed), repair min up/down, persist through outages | milliseconds |
+| `similar_days` | cluster days by net-load shape, solve one 24 h UC per representative day, transfer schedules to lookalike days, repair the seams | a few small MIPs |
+| `lp` | round the LP relaxation; trust everything it already resolved (>99% accurate here) | one full-horizon LP |
+
+Delivery (`--heuristic-fixing`): `off` completes the guess into a full
+solution and warm starts — exact, the solver can overrule anything;
+`screen` additionally fixes the entries the heuristic is confident about
+(priority: units needed even at zero margin; similar_days: units every
+representative agrees never move; lp: integral values); `aggressive`
+fixes every guessed value.
+
+**Guessing well and knowing when you have are different skills.** On the
+52-unit test system `priority` and `lp` predict the final schedule about
+equally well (93–95% of commitments), yet fixing on `priority`'s screen
+costs +2.4% while fixing on `lp`'s costs +0.16%. The 5% each gets wrong is
+not the same 5%: the LP *flags* its uncertainty as fractional values,
+whereas a merit stack has no idea which of its verdicts are shaky. Worse,
+a stack's "this unit isn't needed" reasons only about **capacity**, while
+the optimum commits units for **economics** — a cheap unit can be worth
+starting purely to displace dearer generation already running. That is
+why `priority` only vouches for on-commitments by default.
+
+Practical guidance, measured (168 h, 0.5% gap):
+
+| want | use | medium-system result |
+|---|---|---|
+| exactness, some speedup | any heuristic with `off` | 1.3–1.6x, cost unchanged or marginally better |
+| most speed for ~0.2% cost | `lp` + `screen` | 6.2x, +0.16% |
+| a speed upper bound | `aggressive` | 18x, but +24–31% — not a usable schedule |
+
+`aggressive` is a research bracket, not a mode to run: even with the
+adequacy guarantee below it produces genuinely suboptimal commitments.
+
+All guesses are **capacity-adequate by construction**: each node must be
+able to cover the load it cannot import, and the system must cover total
+net load. The min up/down repair is monotone for the same reason — it
+extends short runs rather than erasing them. Both rules exist because the
+cost of under-committing is asymmetric: surplus commitment wastes a little
+fuel, while a shortfall reappears as unserved energy priced at VOLL. An
+earlier version without these guarantees turned a 135 s solve into a
++3670% one.
+
+Per-window stats record `heuristic_seconds` (guess + completion),
+`heuristic_match_pct` (share of the final schedule the guess predicted),
+`heuristic_fixed_vars` and `heuristic_fallback` (True when the guess
+over-committed and the completion had to relax minimum-output rows).
+
+```bash
+gridlock run --data-dir data/example --uc --hours 720 --tight \
+    --heuristic priority --heuristic-fixing screen
 ```
 
 ## Warm starts and the cyclic wrap
