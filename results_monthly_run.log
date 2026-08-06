@@ -1,0 +1,16 @@
+[rts_gmlc] 8784 h; solving 12 x 168 h segment(s): month01@0, month02@744, month03@1440, month04@2184, month05@2904, month06@3648, month07@4368, month08@5112, month09@5856, month10@6576, month11@7320, month12@8040
+[rts_gmlc] tight=True mip_gap=0.005 time_limit=7200.0s cyclic=True warm start=LP relaxation (no fixing)
+[rts_gmlc] month01   2920.2s       optimal  cost 5,685,140  gap  0.50%  lp-frac  4.13%  match 96.86%
+[rts_gmlc] month02   5111.7s       optimal  cost 7,180,946  gap  0.42%  lp-frac  3.42%  match 97.11%
+[rts_gmlc] month03   7433.6s       optimal  cost 6,484,563  gap  0.50%  lp-frac  6.49%  match 95.98%
+[rts_gmlc] month04   3450.5s       optimal  cost 7,318,870  gap  0.50%  lp-frac  5.12%  match 98.12%
+warning: window 0 finished with termination 'maxTimeLimit' (objective 7360407.472362666, bound 7317240.875636728)
+[rts_gmlc] month05   8524.0s  maxTimeLimit  cost 7,360,407  gap  0.59%  lp-frac  3.69%  match 97.71%
+[rts_gmlc] month06   2988.3s       optimal  cost 9,978,248  gap  0.42%  lp-frac  3.23%  match 99.35%
+[rts_gmlc] month07   1290.8s       optimal  cost 14,871,433  gap  0.28%  lp-frac  2.47%  match 99.31%
+[rts_gmlc] month08   1144.0s       optimal  cost 15,107,334  gap  0.26%  lp-frac  2.78%  match 100.00%
+[rts_gmlc] month09   1263.0s       optimal  cost 14,719,349  gap  0.31%  lp-frac  2.63%  match 98.78%
+[rts_gmlc] month10   1642.5s       optimal  cost 11,905,512  gap  0.20%  lp-frac  2.94%  match 99.33%
+[rts_gmlc] month11   5043.2s       optimal  cost 6,317,564  gap  0.50%  lp-frac  4.37%  match 98.16%
+[rts_gmlc] month12   3428.1s       optimal  cost 8,997,840  gap  0.50%  lp-frac  4.04%  match 98.33%
+[rts_gmlc] finished; 0 failure(s)

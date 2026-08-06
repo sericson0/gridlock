@@ -18,7 +18,13 @@ import pyomo.environ as pyo
 
 from .config import RunConfig
 from .data import SystemData, cluster_identical_units
-from .heuristics import apply_fixing, build_guess, complete_solution, match_fraction
+from .heuristics import (
+    CommitmentGuess,
+    apply_fixing,
+    build_guess,
+    complete_solution,
+    match_fraction,
+)
 from .model import InitialState, build_model
 from .profiling import model_stats
 from .results import compute_cost_summary, extract_window
@@ -39,6 +45,11 @@ class RunResults:
     was passed in, unless ``config.cluster_units`` pooled its generators,
     in which case result columns carry the *cluster* names and this is the
     frame that describes them.
+    ``guess`` is the :class:`~gridlock.heuristics.CommitmentGuess` that
+    seeded the solve, kept because it is the expensive part of a heuristic
+    run and the only record of what the heuristic *predicted* (as opposed
+    to the ``heuristic_match_pct`` summary of how well it did). None when
+    no heuristic ran.
     """
 
     config: RunConfig
@@ -57,6 +68,7 @@ class RunResults:
     cost_summary: pd.Series = field(default=None)
     component_stats: pd.DataFrame | None = None
     system: SystemData | None = None
+    guess: CommitmentGuess | None = None
 
     @property
     def total_cost(self) -> float:
@@ -80,10 +92,34 @@ class RunResults:
         return float(self.window_stats["extract_seconds"].sum())
 
 
-def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
-    """Solve the production cost problem described by ``system`` and ``config``."""
+def run(
+    system: SystemData,
+    config: RunConfig | None = None,
+    initial_state: InitialState | None = None,
+) -> RunResults:
+    """Solve the production cost problem described by ``system`` and ``config``.
+
+    ``initial_state`` pins the hour before hour 0 for a *monolithic* run:
+    commitment, output, min up/down obligations and storage SOC carried in
+    from a previously solved horizon. It is the sequential alternative to
+    the cyclic wrap, so it requires ``config.cyclic=False`` — the wrap
+    defines that same hour as the horizon's last, and the two cannot both
+    hold. Rolling runs derive their own per-window state and ignore this.
+    """
     config = config or RunConfig()
     config.validate()
+    if initial_state is not None:
+        if config.window_hours is not None:
+            raise ValueError(
+                "initial_state applies to monolithic runs; a rolling run "
+                "derives each window's state from the previous window"
+            )
+        if config.cyclic:
+            raise ValueError(
+                "initial_state requires cyclic=False: a carried-in initial "
+                "hour and a wrap to the final hour are alternative "
+                "definitions of the hour before hour 0"
+            )
 
     if config.cluster_units:
         system = cluster_identical_units(system)
@@ -118,8 +154,16 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
     # built once here, completed against the model inside the loop.
     guess = None
     if monolithic and config.heuristic is not None and config.unit_commitment:
+        # The oracle has to start where the model starts. build_model reads
+        # cyclic-ness from the initial state, so a guess built without it
+        # solves a different problem and can contradict carried min up/down
+        # obligations -- which surfaces as an infeasible completion, not as
+        # a merely poor guess.
+        guess_initial = initial_state or _initial_state_for_window(
+            system, config, 0, len(windows), None, monolithic
+        )
         guess_start = time.perf_counter()
-        guess = build_guess(system, config, list(range(total_hours)))
+        guess = build_guess(system, config, list(range(total_hours)), guess_initial)
         guess_seconds = time.perf_counter() - guess_start
 
     collected: list[dict[str, pd.DataFrame]] = []
@@ -131,6 +175,8 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         initial = _initial_state_for_window(
             system, config, index, len(windows), state, monolithic
         )
+        if monolithic and initial_state is not None:
+            initial = initial_state
 
         build_start = time.perf_counter()
         model = build_model(system, config, hours, initial)
@@ -144,6 +190,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
             _seed_model_from_results(model, warmstart_results)
 
         heuristic_seconds = heuristic_fallback = heuristic_fixed = None
+        completion_failed = False
         session = None
         if guess is not None:
             # One session serves completion and main solve, so the model is
@@ -151,8 +198,23 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
             # update — at annual scale translation rivals the LP solve.
             session = HighsSession(model)
             completion_start = time.perf_counter()
-            _, heuristic_fallback = complete_solution(model, guess, session=session)
-            heuristic_fixed = apply_fixing(model, guess, config.heuristic_fixing)
+            try:
+                _, heuristic_fallback = complete_solution(model, guess, session=session)
+                heuristic_fixed = apply_fixing(model, guess, config.heuristic_fixing)
+            except RuntimeError:
+                # An uncompletable guess is a lost warm start, not a lost
+                # run: solve cold rather than failing the whole horizon.
+                print(
+                    f"warning: heuristic '{guess.name}' could not be completed "
+                    "into a feasible solution; solving without a warm start"
+                )
+                for var in model.u.values():
+                    var.unfix()
+                # Keep the guess itself -- it is still the record of what the
+                # heuristic predicted -- and drop only the warm start.
+                completion_failed = True
+                session = None
+                heuristic_fixed = 0
             heuristic_seconds = (
                 guess_seconds + time.perf_counter() - completion_start
             )
@@ -216,6 +278,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
             "heuristic_seconds": heuristic_seconds,
             "heuristic_fixed_vars": heuristic_fixed,
             "heuristic_fallback": heuristic_fallback,
+            "heuristic_completion_failed": completion_failed,
             "heuristic_match_pct": (
                 None if guess is None else match_fraction(model, guess)
             ),
@@ -249,6 +312,7 @@ def run(system: SystemData, config: RunConfig | None = None) -> RunResults:
         objective_value=stats_rows[0]["objective"] if monolithic else None,
         component_stats=component_stats,
         system=system,
+        guess=guess,
     )
     results.cost_summary = compute_cost_summary(system, results)
     return results

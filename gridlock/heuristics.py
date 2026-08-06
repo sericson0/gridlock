@@ -49,7 +49,7 @@ import pyomo.environ as pyo
 
 from .config import RunConfig, SolverSettings
 from .data import SystemData
-from .model import build_model
+from .model import InitialState, build_model
 from .solver import HighsSession, SolveInfo
 
 HEURISTICS = ("priority", "similar_days", "lp")
@@ -67,6 +67,10 @@ class CommitmentGuess:
     ``commitment``: hours x committed-unit frame of 0/1 values.
     ``certain``: same shape, True where the heuristic would stake a fixing
     on the value (used by the ``screen`` delivery mode).
+    ``relaxation``: the continuous values ``commitment`` was rounded from,
+    for the heuristics that have any (only ``lp`` does). Kept because the
+    fractional values carry the heuristic's own uncertainty, which the
+    rounded frame has thrown away.
     """
 
     name: str
@@ -74,6 +78,7 @@ class CommitmentGuess:
     certain: pd.DataFrame
     build_seconds: float = 0.0
     notes: dict = field(default_factory=dict)
+    relaxation: pd.DataFrame | None = None
 
 
 # --------------------------------------------------------------------------
@@ -695,7 +700,10 @@ def _kmeans(
 
 
 def lp_relaxation_guess(
-    system: SystemData, config: RunConfig, hours: list[int]
+    system: SystemData,
+    config: RunConfig,
+    hours: list[int],
+    initial: "InitialState | None" = None,
 ) -> CommitmentGuess:
     """Round the LP relaxation's commitment; trust the values it resolved.
 
@@ -712,8 +720,13 @@ def lp_relaxation_guess(
         tight_generation_limits=config.tight_generation_limits,
         tight_ramp_limits=config.tight_ramp_limits,
     )
-    lp_model = build_model(system, lp_config, hours)
-    HighsSession(lp_model).solve(SolverSettings())
+    # ``initial`` must be forwarded: build_model reads cyclic-ness from it
+    # (``cyclic = initial is None``), so omitting it would relax the oracle
+    # onto a *different* problem than the model this guess has to seed --
+    # and a guess that ignores carried min up/down obligations makes the
+    # completion infeasible rather than merely inaccurate.
+    lp_model = build_model(system, lp_config, hours, initial)
+    lp_info, _ = HighsSession(lp_model).solve(SolverSettings())
 
     units = list(lp_model.G_UC)
     values = pd.DataFrame(
@@ -725,7 +738,9 @@ def lp_relaxation_guess(
 
     # Rounding a 0.49 down silently deletes that unit's capacity, so the
     # rounded schedule gets the same adequacy guarantee as the others.
-    cyclic = config.cyclic and config.window_hours is None
+    # Cyclic-ness is read the same way build_model reads it, so the repair
+    # cannot disagree with the model about whether hour 0 wraps.
+    cyclic = initial is None
     rounded = repair_min_up_down(values.round(), system, cyclic)
     rounded, added = enforce_adequacy(rounded, system, hours)
     if added:
@@ -737,10 +752,15 @@ def lp_relaxation_guess(
         name="lp",
         commitment=rounded,
         certain=certain,
+        relaxation=values,
         build_seconds=time.perf_counter() - start,
         notes={
             "adequacy_additions": added,
             "certain_share": float(certain.to_numpy().mean()),
+            # The relaxation's objective is a valid lower bound on the MIP,
+            # so this is the per-run integrality gap reference.
+            "lp_objective": lp_info.objective,
+            "lp_seconds": lp_info.solve_seconds,
         },
     )
 
@@ -751,16 +771,35 @@ def lp_relaxation_guess(
 
 
 def build_guess(
-    system: SystemData, config: RunConfig, hours: list[int]
+    system: SystemData,
+    config: RunConfig,
+    hours: list[int],
+    initial: InitialState | None = None,
 ) -> CommitmentGuess:
-    """Build the guess selected by ``config.heuristic``."""
+    """Build the guess selected by ``config.heuristic``.
+
+    ``initial`` is the state the seeded model starts from. Only ``lp``
+    can honour it (it solves the same model relaxed); the structural
+    heuristics reason about net load and merit order and have no way to
+    represent a carried min up/down obligation, so pinning them against a
+    concrete initial state would produce a guess the completion cannot
+    satisfy. They are refused rather than allowed to fail downstream.
+    """
     options = dict(config.heuristic_options)
+    carries_state = initial is not None and (
+        bool(initial.commitment) or bool(initial.state_hours)
+    )
+    if config.heuristic == "lp":
+        return lp_relaxation_guess(system, config, hours, initial=initial, **options)
+    if carries_state:
+        raise NotImplementedError(
+            f"heuristic '{config.heuristic}' cannot honour a carried initial "
+            "state; use heuristic='lp' for chained or rolling-state runs"
+        )
     if config.heuristic == "priority":
         return priority_list_guess(system, config, hours, **options)
     if config.heuristic == "similar_days":
         return similar_days_guess(system, config, hours, **options)
-    if config.heuristic == "lp":
-        return lp_relaxation_guess(system, config, hours, **options)
     raise ValueError(f"unknown heuristic '{config.heuristic}' (available: {HEURISTICS})")
 
 
