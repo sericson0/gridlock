@@ -124,6 +124,20 @@ class HighsSession:
 
         if self._opt is None:
             self._opt = Highs()
+            # appsi's default treats a fixed variable as a *parameter*: fixing
+            # or unfixing rewrites every constraint the variable appears in,
+            # as a structural model change. That is catastrophic here, because
+            # the heuristic path fixes all of `u`, solves, and unfixes it again
+            # (see heuristics.complete_solution), and each `u` appears in the
+            # commitment-logic, min up/down, generation-limit and ramp rows.
+            # Measured on one RTS-GMLC week (12,264 commitment variables,
+            # 2026-08): the solve following an unfix cost 1,089.9s with the
+            # default and 3.3s without -- 332x, and it grows superlinearly with
+            # horizon (the same test over 24h costs 11.8s vs 0.9s). Pinning via
+            # bounds instead is what the solver wants anyway: HiGHS presolve
+            # removes a column whose bounds are equal, so the model it solves
+            # is the same one either way.
+            self._opt.update_config.treat_fixed_vars_as_params = False
         opt = self._opt
         self._reset_options()
         if cold:
