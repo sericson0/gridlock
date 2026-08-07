@@ -103,7 +103,19 @@ class RunConfig:
     heuristic_options
         Keyword overrides passed to the guess builder (e.g.
         ``{"reserve_margin": 0.1}`` for 'priority',
-        ``{"num_representatives": 6}`` for 'similar_days').
+        ``{"num_representatives": 6}`` for 'similar_days',
+        ``{"soft_min_up_hours": 3}`` for 'ensemble').
+    soft_fixing_budget
+        With ``heuristic_fixing='screen'``, deliver the entries the guess
+        marked *soft* as a deviation allowance instead of pinning them: one
+        local-branching row permitting at most this many disagreements with
+        the guess across the whole soft set. Only 'ensemble' marks any, and
+        only when given ``soft_min_up_hours``. The point is the residue —
+        fast peaking units hold half the binaries, are committed under 1% of
+        the time, and are where essentially every screen error lands, so
+        pinning them is where the quality goes and excluding them is where
+        the speed goes. A budget keeps most of the restriction and hands
+        back exactly the freedom the mistakes need.
 
     The tightening and clustering switches default to False so recorded
     baselines stay comparable; turn them on to measure what they buy.
@@ -141,6 +153,7 @@ class RunConfig:
     heuristic: str | None = None
     heuristic_fixing: str = "off"
     heuristic_options: dict = field(default_factory=dict)
+    soft_fixing_budget: int | None = None
     window_hours: int | None = None
     lookahead_hours: int = 24
     initial_soc_fraction: float = 0.5
@@ -162,10 +175,10 @@ class RunConfig:
                     "(window_hours must be None)"
                 )
         if self.heuristic is not None:
-            if self.heuristic not in ("priority", "similar_days", "lp"):
+            if self.heuristic not in ("priority", "similar_days", "lp", "ensemble"):
                 raise ValueError(
                     f"unknown heuristic '{self.heuristic}' "
-                    "(available: priority, similar_days, lp)"
+                    "(available: priority, similar_days, lp, ensemble)"
                 )
             if self.window_hours is not None:
                 raise ValueError("heuristic only applies to monolithic runs")
@@ -179,6 +192,14 @@ class RunConfig:
                 f"unknown heuristic_fixing '{self.heuristic_fixing}' "
                 "(available: off, screen, aggressive)"
             )
+        if self.soft_fixing_budget is not None:
+            if self.soft_fixing_budget < 0:
+                raise ValueError("soft_fixing_budget must be non-negative")
+            if self.heuristic_fixing != "screen":
+                raise ValueError(
+                    "soft_fixing_budget applies to heuristic_fixing='screen': "
+                    "it governs the entries the screen would otherwise pin"
+                )
         if self.lookahead_hours < 0:
             raise ValueError("lookahead_hours must be non-negative")
         if not 0.0 <= self.initial_soc_fraction <= 1.0:

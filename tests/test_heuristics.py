@@ -4,7 +4,9 @@ import pytest
 
 from gridlock import RunConfig, run
 from gridlock.heuristics import (
+    apply_soft_budget,
     complete_solution,
+    ensemble_guess,
     derive_startup_shutdown,
     enforce_adequacy,
     import_capacity_mw,
@@ -21,6 +23,7 @@ from gridlock.model import build_model
 from conftest import gen, line, make_system
 
 import pandas as pd
+import pyomo.environ as pyo
 
 
 def merit_system(hours=24, peak=380.0):
@@ -261,7 +264,7 @@ def test_similar_days_transfers_schedules_between_lookalike_days():
 # --------------------------------------------------- delivery and end-to-end
 
 
-@pytest.mark.parametrize("heuristic", ["priority", "similar_days", "lp"])
+@pytest.mark.parametrize("heuristic", ["priority", "similar_days", "lp", "ensemble"])
 def test_warmstart_delivery_preserves_the_optimum(heuristic):
     system = merit_system(hours=48)
     plain = run(system, RunConfig(unit_commitment=True))
@@ -333,3 +336,113 @@ def test_priority_rejects_clustered_units():
     system.generators.loc["mid", "num_units"] = 2.0
     with pytest.raises(NotImplementedError):
         priority_list_guess(system, RunConfig(), list(range(24)))
+
+
+# ----------------------------------------------------------------- ensemble
+
+
+def test_ensemble_vouches_only_where_all_three_agree():
+    """Confidence is the intersection, so it cannot exceed any member's own."""
+    system = merit_system(hours=48)
+    config = RunConfig(unit_commitment=True)
+    hours = list(range(48))
+    guess = ensemble_guess(system, config, hours)
+    lp = lp_relaxation_guess(system, config, hours)
+
+    assert guess.name == "ensemble"
+    assert guess.notes["ensemble_members"] == 3
+    # The schedule delivered is the LP's; only the confidence differs.
+    pd.testing.assert_frame_equal(guess.commitment, lp.commitment)
+    assert guess.certain.to_numpy().sum() <= lp.certain.to_numpy().sum()
+    # A unit with any fractional hour is untrusted in *every* hour of it.
+    fractional = ((lp.relaxation > 1e-6) & (lp.relaxation < 1 - 1e-6)).any(axis=0)
+    for unit in fractional.index[fractional]:
+        assert not guess.certain[unit].any()
+
+
+def test_ensemble_marks_fast_units_soft_not_certain_free():
+    """soft_min_up_hours splits the screen; it does not shrink it."""
+    system = merit_system(hours=48)
+    config = RunConfig(unit_commitment=True)
+    hours = list(range(48))
+    plain = ensemble_guess(system, config, hours)
+    split = ensemble_guess(system, config, hours, soft_min_up_hours=1)
+
+    # Same confidence, differently delivered.
+    assert split.certain.to_numpy().sum() == plain.certain.to_numpy().sum()
+    assert split.soft is not None and plain.soft is None
+    # "peak" has min_up 1 in merit_system; the others are 2 and 4.
+    assert split.soft["peak"].any()
+    assert not split.soft["base"].any()
+    # Soft entries are always a subset of the confident ones.
+    assert not (split.soft & ~split.certain).to_numpy().any()
+
+
+def test_soft_budget_row_counts_deviations_from_the_guess():
+    system = merit_system(hours=24)
+    config = RunConfig(unit_commitment=True)
+    hours = list(range(24))
+    guess = ensemble_guess(system, config, hours, soft_min_up_hours=1)
+    model = build_model(system, config, hours)
+
+    covered = apply_soft_budget(model, guess, budget=3)
+    assert covered == int(guess.soft.to_numpy().sum())
+    assert hasattr(model, "soft_fixing_budget")
+    # The guess itself sits at distance zero, so the row must admit it.
+    for (g, t), var in model.u.items():
+        var.set_value(float(guess.commitment.at[t, g]))
+    assert pyo.value(model.soft_fixing_budget.body) == pytest.approx(0.0)
+
+
+def test_soft_budget_is_a_no_op_without_soft_entries():
+    system = merit_system(hours=24)
+    config = RunConfig(unit_commitment=True)
+    hours = list(range(24))
+    guess = ensemble_guess(system, config, hours)  # no soft_min_up_hours
+    model = build_model(system, config, hours)
+    assert apply_soft_budget(model, guess, budget=5) == 0
+    assert not hasattr(model, "soft_fixing_budget")
+
+
+def test_zero_budget_matches_hard_fixing():
+    """budget=0 forbids every deviation, so it is fixing by another route."""
+    system = merit_system(hours=48)
+    plain = run(system, RunConfig(unit_commitment=True))
+    soft = run(
+        system,
+        RunConfig(
+            unit_commitment=True,
+            heuristic="ensemble",
+            heuristic_fixing="screen",
+            heuristic_options={"soft_min_up_hours": 1},
+            soft_fixing_budget=0,
+        ),
+    )
+    stats = soft.window_stats.iloc[0]
+    assert stats["heuristic_soft_vars"] > 0
+    assert soft.total_cost >= plain.total_cost - 1e-6
+
+
+def test_budget_recovers_what_fixing_would_have_excluded():
+    """A budget is looser than a pin: cost can only improve, never worsen."""
+    system = merit_system(hours=48)
+    options = dict(
+        unit_commitment=True,
+        heuristic="ensemble",
+        heuristic_fixing="screen",
+        heuristic_options={"soft_min_up_hours": 1},
+    )
+    pinned = run(system, RunConfig(**options, soft_fixing_budget=0))
+    budgeted = run(system, RunConfig(**options, soft_fixing_budget=40))
+    assert budgeted.total_cost <= pinned.total_cost + 1e-6
+
+
+def test_validate_rejects_a_budget_without_a_screen():
+    with pytest.raises(ValueError, match="soft_fixing_budget"):
+        RunConfig(
+            heuristic="ensemble", heuristic_fixing="off", soft_fixing_budget=10
+        ).validate()
+    with pytest.raises(ValueError, match="non-negative"):
+        RunConfig(
+            heuristic="ensemble", heuristic_fixing="screen", soft_fixing_budget=-1
+        ).validate()

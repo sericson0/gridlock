@@ -21,6 +21,7 @@ from .data import SystemData, cluster_identical_units
 from .heuristics import (
     CommitmentGuess,
     apply_fixing,
+    apply_soft_budget,
     build_guess,
     complete_solution,
     match_fraction,
@@ -190,6 +191,7 @@ def run(
             _seed_model_from_results(model, warmstart_results)
 
         heuristic_seconds = heuristic_fallback = heuristic_fixed = None
+        heuristic_soft = 0
         completion_failed = False
         session = None
         if guess is not None:
@@ -201,6 +203,9 @@ def run(
             try:
                 _, heuristic_fallback = complete_solution(model, guess, session=session)
                 heuristic_fixed = apply_fixing(model, guess, config.heuristic_fixing)
+                heuristic_soft = apply_soft_budget(
+                    model, guess, config.soft_fixing_budget
+                )
             except RuntimeError:
                 # An uncompletable guess is a lost warm start, not a lost
                 # run: solve cold rather than failing the whole horizon.
@@ -215,6 +220,7 @@ def run(
                 completion_failed = True
                 session = None
                 heuristic_fixed = 0
+                heuristic_soft = 0
             heuristic_seconds = (
                 guess_seconds + time.perf_counter() - completion_start
             )
@@ -233,10 +239,11 @@ def run(
                     warmstart=True,
                 )
             except RuntimeError:
-                # Fixing can over-constrain the model into infeasibility.
-                # Losing the run to a heuristic would be worse than losing
-                # the speedup, so unfix and solve as a plain warm start.
-                if not heuristic_fixed:
+                # Fixing can over-constrain the model into infeasibility, and
+                # so can a deviation budget set below what the horizon needs.
+                # Losing the run to a heuristic would be worse than losing the
+                # speedup, so drop both and solve as a plain warm start.
+                if not heuristic_fixed and not heuristic_soft:
                     raise
                 print(
                     f"warning: heuristic '{guess.name}' fixing left no feasible "
@@ -244,7 +251,10 @@ def run(
                 )
                 for var in model.u.values():
                     var.unfix()
+                if heuristic_soft:
+                    model.soft_fixing_budget.deactivate()
                 heuristic_fixed = 0
+                heuristic_soft = 0
                 info, duals = session.solve(
                     config.solver,
                     want_duals=want_duals,
@@ -277,6 +287,7 @@ def run(
             "warmstart_seconds": warmstart_seconds if warm else None,
             "heuristic_seconds": heuristic_seconds,
             "heuristic_fixed_vars": heuristic_fixed,
+            "heuristic_soft_vars": heuristic_soft,
             "heuristic_fallback": heuristic_fallback,
             "heuristic_completion_failed": completion_failed,
             "heuristic_match_pct": (

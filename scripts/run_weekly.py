@@ -197,11 +197,17 @@ def solve_week(
     start_hour = segment.start_hour
     sliced = slice_hours(system, start_hour, start_hour + args.hours)
 
+    options = {}
+    if args.heuristic == "ensemble" and args.soft_min_up is not None:
+        options["soft_min_up_hours"] = args.soft_min_up
+
     config = RunConfig(
         unit_commitment=True,
         cyclic=not args.chain,
-        heuristic="lp",
-        heuristic_fixing="off",
+        heuristic=args.heuristic,
+        heuristic_fixing=args.fixing,
+        heuristic_options=options,
+        soft_fixing_budget=args.soft_budget,
         tight_generation_limits=args.tight,
         tight_ramp_limits=args.tight,
         voll=args.voll,
@@ -233,6 +239,7 @@ def solve_week(
         "lp_relaxation": lp_values,
         "guess_commitment": guess.commitment,
         "guess_certain": guess.certain.astype(int),
+        **({"guess_soft": guess.soft.astype(int)} if guess.soft is not None else {}),
         "dispatch": results.dispatch,
         "shed": results.shed,
         "storage_soc": results.storage_soc,
@@ -277,6 +284,8 @@ def solve_week(
         "heuristic_seconds": _maybe_float(stats["heuristic_seconds"]),
         "heuristic_match_pct": _maybe_float(stats["heuristic_match_pct"]),
         "heuristic_fallback": bool(stats["heuristic_fallback"]),
+        "heuristic_fixed_vars": _maybe_float(stats.get("heuristic_fixed_vars")),
+        "heuristic_soft_vars": _maybe_float(stats.get("heuristic_soft_vars")),
         "simplex_iterations": _maybe_float(stats.get("simplex_iterations")),
         "mip_nodes": _maybe_float(stats.get("mip_nodes")),
         "highs_run_seconds": _maybe_float(stats.get("highs_run_seconds")),
@@ -348,6 +357,32 @@ def main() -> int:
         action="store_false",
         help="skip HiGHS log parsing (leaves highs_run_seconds empty)",
     )
+    parser.add_argument(
+        "--heuristic",
+        default="lp",
+        choices=("priority", "similar_days", "lp", "ensemble"),
+        help="commitment guess to warm start from (default: lp)",
+    )
+    parser.add_argument(
+        "--fixing",
+        default="off",
+        choices=("off", "screen", "aggressive"),
+        help="how hard to lean on the guess (default: off, i.e. exact)",
+    )
+    parser.add_argument(
+        "--soft-budget",
+        type=int,
+        default=None,
+        help="with --fixing screen: allow the guess's soft entries to deviate "
+        "this many times in total instead of pinning them",
+    )
+    parser.add_argument(
+        "--soft-min-up",
+        type=int,
+        default=None,
+        help="with --heuristic ensemble: units whose minimum up time is at or "
+        "below this get the deviation budget rather than a fixing",
+    )
     parser.add_argument("--mip-gap", type=float, default=1e-4)
     parser.add_argument("--time-limit", type=float, default=1800.0)
     parser.add_argument("--threads", type=int, default=None)
@@ -406,7 +441,9 @@ def main() -> int:
     print(
         f"[{args.label}] tight={args.tight} mip_gap={args.mip_gap} "
         f"time_limit={args.time_limit}s cyclic={not args.chain} "
-        f"warm start=LP relaxation (no fixing)",
+        f"warm start={args.heuristic} fixing={args.fixing}"
+        + (f" soft_budget={args.soft_budget} soft_min_up={args.soft_min_up}"
+           if args.soft_budget is not None else ""),
         flush=True,
     )
     # A run is only comparable to another with the same knobs, so record them.

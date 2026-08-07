@@ -29,6 +29,11 @@ Heuristics (``RunConfig.heuristic``):
 - ``lp``            the LP-relaxation oracle: keep integral values, round
                     the fractional core (99%+ accurate here, but needs a
                     full-horizon LP solve)
+- ``ensemble``      all three, delivering the LP's schedule but vouching only
+                    where the other two agree *and* the LP left the whole
+                    unit integral. Fixes less than ``lp`` and is an order of
+                    magnitude safer doing it; can hand its residue to a
+                    deviation budget rather than a pin (``soft_fixing_budget``)
 
 Guesses are *completed* into full solutions by solving the model once with
 the guessed commitment fixed (every continuous variable then gets a value,
@@ -52,7 +57,7 @@ from .data import SystemData
 from .model import InitialState, build_model
 from .solver import HighsSession, SolveInfo
 
-HEURISTICS = ("priority", "similar_days", "lp")
+HEURISTICS = ("priority", "similar_days", "lp", "ensemble")
 FIXING_MODES = ("off", "screen", "aggressive")
 
 # Availability below this is treated as an outage hour when stacking.
@@ -79,6 +84,15 @@ class CommitmentGuess:
     build_seconds: float = 0.0
     notes: dict = field(default_factory=dict)
     relaxation: pd.DataFrame | None = None
+    soft: pd.DataFrame | None = None
+    """Certain entries to deliver as a *deviation budget* rather than a fixing.
+
+    True where the guess is confident but the unit is one whose mistakes are
+    known to concentrate (see :func:`ensemble_guess`). Those entries are left
+    free and constrained collectively by one local-branching row instead of
+    being pinned individually — the difference between "you may not disagree"
+    and "you may disagree this many times".
+    """
 
 
 # --------------------------------------------------------------------------
@@ -766,6 +780,134 @@ def lp_relaxation_guess(
 
 
 # --------------------------------------------------------------------------
+# Heuristic 4: the ensemble
+# --------------------------------------------------------------------------
+
+
+def ensemble_guess(
+    system: SystemData,
+    config: RunConfig,
+    hours: list[int],
+    initial: "InitialState | None" = None,
+    soft_min_up_hours: int | None = None,
+) -> CommitmentGuess:
+    """Run all three heuristics and trust only what they agree on.
+
+    The schedule delivered is the LP's — it is the strongest single oracle
+    (98.3% accurate against the MIP on the 12-week RTS-GMLC study, against
+    92.7% for previous-week persistence). What the other two add is not a
+    better guess but a better *confidence signal*, and the measured lift is
+    large: among LP-integral entries, the LP is wrong 0.41% of the time when
+    ``priority`` and ``similar_days`` both agree and 7.87% of the time when
+    they do not — a 19x separation that integrality alone cannot see.
+
+    Confidence therefore requires two things:
+
+    - the LP left the unit integral across *every* hour of the horizon, not
+      merely this one. Whether the relaxation resolves a unit is a property
+      of the unit, not the hour; screening per hour keeps the entries either
+      side of a contested boundary and is 3.5x more error-prone.
+    - both structural heuristics reproduce the LP's value.
+
+    Together that screen fixes 78% of the binaries at a measured 0.071%
+    error, against 96% at 0.775% for plain integrality — fewer fixings, an
+    order of magnitude safer.
+
+    ``soft_min_up_hours`` marks the residue. What survives the screen and is
+    still wrong is overwhelmingly one thing: whole missed starts on fast
+    peaking units, 3-hour blocks matching their minimum up time, in hours
+    where merit order says nothing needs to run. Those units cannot be
+    screened out — they hold half the binaries and are committed 0.4% of the
+    time, so excluding them costs ~100 fixings per error avoided — but they
+    can be given a deviation budget instead of a pin. Units whose minimum up
+    time is at or below this many hours have their confident entries marked
+    :attr:`CommitmentGuess.soft`; the runner then delivers them as one
+    local-branching row (see :func:`apply_soft_budget`). ``None`` disables
+    the split and fixes everything the screen vouches for.
+    """
+    start = time.perf_counter()
+    carries_state = initial is not None and (
+        bool(initial.commitment) or bool(initial.state_hours)
+    )
+    lp = lp_relaxation_guess(system, config, hours, initial=initial)
+    if carries_state:
+        # priority and similar_days cannot honour a carried obligation, so
+        # there is no ensemble to form. Degrade to the LP alone rather than
+        # silently vouching for a two-thirds ensemble.
+        lp.notes["ensemble"] = "lp-only (carried initial state)"
+        lp.name = "ensemble"
+        return lp
+
+    others = {}
+    for name, builder in (("priority", priority_list_guess),
+                          ("similar_days", similar_days_guess)):
+        try:
+            others[name] = builder(system, config, hours)
+        except Exception as error:  # a missing member weakens the screen, not the run
+            others[name] = None
+            lp.notes[f"{name}_failed"] = f"{type(error).__name__}: {error}"
+
+    # Unit-level integrality: the column is clean only if no hour of it is
+    # fractional. Read off the raw relaxation, before repair and adequacy
+    # moved anything, because those moves are not LP verdicts.
+    values = lp.relaxation
+    fractional = (values > _TOL) & (values < 1.0 - _TOL)
+    unit_clean = ~fractional.any(axis=0)
+    certain = pd.DataFrame(
+        np.tile(unit_clean.to_numpy(), (len(hours), 1)),
+        index=lp.commitment.index,
+        columns=lp.commitment.columns,
+    )
+    agreed = 0
+    for name, guess in others.items():
+        if guess is None:
+            continue
+        certain &= guess.commitment.reindex_like(lp.commitment) == lp.commitment
+        agreed += 1
+
+    soft = None
+    if soft_min_up_hours is not None:
+        fast = system.generators.loc[lp.commitment.columns, "min_up_time_hr"] <= soft_min_up_hours
+        # A cluster commits an integer count, for which |u - guess| is not the
+        # linear expression the budget row assumes, so clusters stay hard.
+        single = system.generators.loc[lp.commitment.columns, "num_units"] == 1
+        soft = certain & pd.DataFrame(
+            np.tile((fast & single).to_numpy(), (len(hours), 1)),
+            index=certain.index,
+            columns=certain.columns,
+        )
+
+    notes = dict(lp.notes)
+    notes.update(
+        {
+            "ensemble_members": 1 + agreed,
+            "certain_share": float(certain.to_numpy().mean()),
+            "lp_certain_share": float(lp.certain.to_numpy().mean()),
+            "soft_share": 0.0 if soft is None else float(soft.to_numpy().mean()),
+            "build_seconds_lp": lp.build_seconds,
+        }
+    )
+    for name, guess in others.items():
+        if guess is not None:
+            notes[f"{name}_agreement"] = float(
+                (guess.commitment.reindex_like(lp.commitment) == lp.commitment)
+                .to_numpy()
+                .mean()
+            )
+            notes[f"{name}_seconds"] = guess.build_seconds
+
+    return CommitmentGuess(
+        name="ensemble",
+        commitment=lp.commitment,
+        certain=certain,
+        relaxation=values,
+        soft=soft,
+        build_seconds=time.perf_counter() - start,
+        notes=notes,
+    )
+
+
+# --------------------------------------------------------------------------
 # Dispatcher and completion
 # --------------------------------------------------------------------------
 
@@ -791,6 +933,8 @@ def build_guess(
     )
     if config.heuristic == "lp":
         return lp_relaxation_guess(system, config, hours, initial=initial, **options)
+    if config.heuristic == "ensemble":
+        return ensemble_guess(system, config, hours, initial=initial, **options)
     if carries_state:
         raise NotImplementedError(
             f"heuristic '{config.heuristic}' cannot honour a carried initial "
@@ -846,15 +990,62 @@ def complete_solution(
 
 
 def apply_fixing(model: pyo.ConcreteModel, guess: CommitmentGuess, mode: str) -> int:
-    """Fix commitment variables per the delivery mode; returns how many."""
+    """Fix commitment variables per the delivery mode; returns how many.
+
+    Entries the guess marked :attr:`~CommitmentGuess.soft` are skipped in
+    ``screen`` mode — they are delivered by :func:`apply_soft_budget`
+    instead. ``aggressive`` ignores the distinction, since its whole point
+    is to bound what total fixing can do.
+    """
     if mode == "off":
         return 0
+    soft = guess.soft
     fixed = 0
     for (g, t), var in model.u.items():
-        if mode == "aggressive" or bool(guess.certain.at[t, g]):
+        if mode == "aggressive":
+            var.fix(float(guess.commitment.at[t, g]))
+            fixed += 1
+        elif bool(guess.certain.at[t, g]) and not (
+            soft is not None and bool(soft.at[t, g])
+        ):
             var.fix(float(guess.commitment.at[t, g]))
             fixed += 1
     return fixed
+
+
+def apply_soft_budget(
+    model: pyo.ConcreteModel, guess: CommitmentGuess, budget: int | None
+) -> int:
+    """Constrain the soft entries to deviate from the guess at most ``budget`` times.
+
+    One local-branching row (Fischetti & Lodi, Math. Prog. 98, 2003) over the
+    entries :func:`ensemble_guess` marked soft::
+
+        sum_{guess=0} u[g,t]  +  sum_{guess=1} (1 - u[g,t])  <=  budget
+
+    which is exact for binary ``u`` because each term *is* ``|u - guess|``.
+    ``budget = 0`` reduces to hard fixing; larger values buy back freedom one
+    entry at a time. Returns how many variables the row covers.
+
+    This is a restriction, not a relaxation: a budget below the optimum's
+    true distance from the guess excludes it. On the 12-week RTS-GMLC study
+    the observed distance over the fast fleet peaked at 20 and averaged 4.9,
+    so a budget in the mid-20s covered every week — but that is a calibration
+    on one system, not a bound, and it should be re-derived per system.
+    """
+    if budget is None or guess.soft is None:
+        return 0
+    terms = []
+    for (g, t), var in model.u.items():
+        if not bool(guess.soft.at[t, g]):
+            continue
+        terms.append(var if guess.commitment.at[t, g] < 0.5 else 1.0 - var)
+    if not terms:
+        return 0
+    model.soft_fixing_budget = pyo.Constraint(
+        expr=pyo.quicksum(terms) <= float(budget)
+    )
+    return len(terms)
 
 
 def match_fraction(model: pyo.ConcreteModel, guess: CommitmentGuess) -> float:
