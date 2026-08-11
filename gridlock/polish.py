@@ -11,11 +11,18 @@ and none of those three ever removes a commitment.
 
 The polish buys the missing few percent with a *restricted MIP*: pin only
 what the guess is confident about, leave the contested core integral, and
-solve that small problem. The core is small because the LP relaxation
-resolves most of the schedule — 2.5-5.4% of binaries are fractional on
-these instances — so the sub-MIP branches over a few hundred variables
-instead of ~12,000, and it is free to *decommit*, which is the one thing
-the guess pipeline structurally cannot do.
+solve that. The core is small because the LP relaxation resolves most of
+the schedule — 2.5-5.4% of binaries are fractional on these instances — so
+the sub-MIP branches over a few hundred variables instead of ~12,000, and
+it is free to *decommit*, which is the one thing the guess pipeline
+structurally cannot do.
+
+Small in binaries is not the same as cheap, and that is the thing to know
+before tuning this: the restriction removes columns but leaves the whole
+168-hour dispatch, network and storage LP underneath, so a node still
+costs seconds. A 168 h sub-MIP gets through 0-2 nodes in two minutes and
+~150 in ten. The budget therefore has to cover the root loop or the polish
+returns the guess it was handed, having spent the time.
 
 **Every fixing is released before returning.** The restriction exists only
 to manufacture an incumbent; the schedule it produces is handed to the
@@ -51,13 +58,19 @@ SCREENS = ("entry", "unit")
 # own sake. The threshold sits ``mip_gap/(1-mip_gap)`` above the LP bound —
 # 0.5% on these runs — so a sub-MIP allowed to stop 0.5% short of its own
 # optimum could spend the entire margin it was called to recover; a tenth of
-# that leaves the arithmetic room to work. The time limit is the honest
-# constraint: the polish is only worth doing if it costs meaningfully less
-# than the solve it replaces (1,200 s+, censored, on the hard RTS-GMLC
-# weeks), and a sub-MIP that has not converged in two minutes is one whose
-# free core was mis-screened rather than one that needs longer.
+# that leaves the arithmetic room to work.
+#
+# The time limit is the awkward one, because the payoff is not gradual. A
+# 168 h RTS-GMLC sub-MIP reaches 0-2 nodes in 120 s — presolve, the root LP
+# and the root cut loop consume the budget — and on two of three weeks
+# measured that bought exactly nothing, while the same sub-MIP given 600 s
+# solved to optimality in 550 s and took week00's margin from +2.384% to
+# +0.618%. A budget below what the root loop needs is therefore worse than
+# not polishing at all: it costs the time and returns the guess it was
+# given. 600 s is what those instances needed; a smaller system converges
+# long before it (48 h took 38 s) and never notices the limit.
 _DEFAULT_GAP = 5e-4
-_DEFAULT_SECONDS = 120.0
+_DEFAULT_SECONDS = 600.0
 
 
 @dataclass
