@@ -29,6 +29,7 @@ from .heuristics import (
     match_fraction,
 )
 from .model import InitialState, build_model
+from .polish import polish_guess
 from .profiling import model_stats
 from .results import compute_cost_summary, extract_window
 from .solver import HighsSession, SolveInfo, solve_model
@@ -219,6 +220,29 @@ def run(
                     model, guess, session=session
                 )
                 completion_objective = completion_info.objective
+                if config.polish_options is not None:
+                    # Solve the contested core as a restricted MIP and take
+                    # its schedule as the warm start. Every fixing it makes
+                    # is released inside the call, so the solve below is the
+                    # same unrestricted problem it would otherwise be —
+                    # only the incumbent it starts from is cheaper.
+                    polished = polish_guess(
+                        model,
+                        guess,
+                        config,
+                        session=session,
+                        warmstart=not heuristic_fallback,
+                        baseline_objective=completion_objective,
+                        **config.polish_options,
+                    )
+                    if polished.succeeded:
+                        guess = polished.guess
+                        completion_objective = polished.info.objective
+                        # The sub-MIP solved the model with its minimum-output
+                        # rows active, so its objective is what the schedule
+                        # really costs even when the completion had to relax
+                        # them; the margin is no longer the misleading one.
+                        heuristic_fallback = False
                 heuristic_fixed = apply_fixing(model, guess, config.heuristic_fixing)
                 heuristic_soft = apply_soft_budget(
                     model, guess, config.soft_fixing_budget

@@ -171,6 +171,17 @@ class RunConfig:
     profile: bool = False
     solver: SolverSettings = field(default_factory=SolverSettings)
     heuristic_repair: bool | dict = False
+    polish_options: dict | None = None
+    """Sub-MIP polish settings, or None (default) to skip the polish entirely.
+
+    ``{}`` enables it with :mod:`gridlock.polish`'s defaults; the keys are
+    that module's ``polish_guess`` keywords (``screen``, ``seconds``,
+    ``gap``). The polish pins what the guess is confident about, solves the
+    contested core as a small MIP, **releases every fixing**, and hands the
+    result to the real model as the warm start — so it changes what the
+    solver starts from and never what it is allowed to conclude. Requires
+    ``heuristic``: there is nothing to polish without a guess.
+    """
 
     def validate(self) -> None:
         if self.num_hours is not None and self.num_hours < 1:
@@ -211,6 +222,11 @@ class RunConfig:
                     "soft_fixing_budget applies to heuristic_fixing='screen': "
                     "it governs the entries the screen would otherwise pin"
                 )
+        if self.polish_options is not None and self.heuristic is None:
+            raise ValueError(
+                "polish_options needs a heuristic: the polish improves a "
+                "guess, it does not produce one"
+            )
         if self.lookahead_hours < 0:
             raise ValueError("lookahead_hours must be non-negative")
         if not 0.0 <= self.initial_soc_fraction <= 1.0:

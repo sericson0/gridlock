@@ -296,11 +296,69 @@ tolerance band, and canonicalize (2a) before storing.
 
 ## Track 3 — other approaches
 
-**3a. Sub-MIP polish.** Fix the screen, solve the restricted MIP to
-optimality, **release every fixing**, then warm start the true model. The
-fractional core is 3–6% of binaries (~400–800 free), so the restricted
-problem is small. Releasing before the real solve is what keeps the run
-exact while still using the restriction to manufacture an incumbent.
+**3a. Sub-MIP polish — built.** `gridlock/polish.py`, switched on with
+`RunConfig.polish_options` (None, the default, is the old behaviour
+exactly). Pin the screen, solve the restricted MIP, **release every
+fixing**, warm start the true model with what comes back. Releasing before
+the real solve is what keeps the run exact; a restricted optimum is not a
+bound on the true problem, so the sub-MIP's dual bound is discarded rather
+than returned.
+
+Weeks 00/09/26 at 168 h, entry screen (pin what the guess vouches for,
+entry by entry), sub-MIP gap 5e-4, on a contended machine:
+
+| week | free binaries | baseline | 120 s budget | longer budget |
+|---|---|---|---|---|
+| 00 | 601 (4.9%) | +2.384% | +2.384% | **+0.618%** — 600 s, optimal in 550 s, 150 nodes |
+| 09 | 702 (5.7%) | +1.533% | +1.533% | **+0.695%** — 900 s, optimal in 637 s, 430 nodes |
+| 26 | 310 (2.5%) | +3.440% | **−0.211%** | not run: it already clears |
+
+Four findings, none of which was visible before it was built.
+
+**The budget binds, not the idea.** At 168 h the sub-MIP reaches 0–2 nodes
+in 120 s — presolve, the root LP and the root cut loop eat the whole
+budget — so two minutes bought nothing on the two weeks whose margin is
+real commitment cost. Given ten, both solve their restricted problem to
+optimality and hand back 1.77 of week00's 2.38 points and 0.84 of week09's
+1.53. Week09's polished schedule commits 2,309 unit-hours against the
+guess's 2,458: the monotone +2.7% over-commitment, removed directly. On a
+48 h slice, where the sub-MIP converges in 38 s, +14.13% becomes +0.34%.
+
+**The screen that is right for a fixing is wrong for a polish.**
+Unit-level integrality is 7x safer to pin, but nothing pinned here
+survives the call, so the only question is how much sub-MIP fits in the
+budget: the unit screen frees 3,192 of week00's binaries against the entry
+screen's 601, and at 168 h it lost (−0.044% vs −0.211% on week26, nothing
+on 00/09). It edges ahead only at 48 h, where both fit in the budget and
+freedom is worth more than speed (+0.254% vs +0.337%, at 3x the time and
+without converging). Dilating the free set by ±6 hours around each
+contested entry (1,132 free) also lost — +0.667% against +0.618%, and it
+was still 0.83% from its own optimum when the 600 s ran out.
+
+**The restriction has a floor, and on both hard weeks the floor is above
+the threshold.** Solved to optimality the entry screen still leaves
++0.618% and +0.695% — week00's restricted optimum is 5,713,816 against a
+threshold of 5,678,714 and the known feasible 5,676,660, so its pinned
+values exclude every schedule that would clear. More time cannot fix that;
+only a screen that frees more can, and the two screens that free more are
+already too slow to converge. The polish lowers the margin a long way and
+then stops, at a floor that is suspiciously similar on both weeks and is
+worth measuring on more of them.
+
+**Most of week26's win was shed, not commitment.** Its guess sheds 54.1
+MWh — the 1f defect — and the sub-MIP's dispatch prices that at VOLL while
+its free commitments can respond, so 99.4% of the $544k recovered was
+unserved energy. That also explains the split: week26 clears in two
+minutes because its money is sitting in the root LP, while weeks 00 and 09
+(3.5 and 0 MWh shed) have to find theirs by branching.
+
+What is *not* measured is the only question that decides whether this is
+worth running: what the polished start does to the solve after it. The
+margin says week26's would end at one node; for weeks 00 and 09 it says
+only that the start is much better, and 550–640 s of polish has to be
+weighed against solves that were still 1.32% and 0.96% from their bound
+when 1,200 s ran out. Both need a real run at a limit long enough not to
+censor it.
 
 **3b. Fix-and-optimize over time blocks.** Complement to 3a: 3a decomposes
 by variable, this by time. Free one overlapping 24–48 h block, fix the

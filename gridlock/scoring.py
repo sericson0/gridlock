@@ -46,6 +46,8 @@ from .heuristics import (
     hot_start_margin,
 )
 from .model import InitialState, build_model
+from .polish import polish_guess
+from .solver import HighsSession
 
 
 @dataclass
@@ -130,7 +132,13 @@ def score_guess(
     way to get a margin for the structural heuristics, which carry no bound
     of their own.
 
-    The MIP is never solved. Confirm a winner with a real run.
+    With ``config.polish_options`` set, the completed guess is additionally
+    handed to :func:`~gridlock.polish.polish_guess` and what is scored is
+    the schedule that comes back. The *true* MIP is still never solved —
+    the polish solves a restricted one, whose objective is a feasible cost
+    for the real model and never a bound on it.
+
+    Confirm a winner with a real run.
     """
     hours = list(range(system.num_hours)) if hours is None else list(hours)
 
@@ -141,8 +149,35 @@ def score_guess(
 
     model = build_model(system, config, hours, initial)
     completion_start = time.perf_counter()
-    info, used_fallback = complete_solution(model, guess, settings=settings)
+    # One session serves the completion and the polish, so the model is
+    # translated once and the sub-MIP's pinning arrives as an incremental
+    # bound update.
+    session = HighsSession(model) if config.polish_options is not None else None
+    info, used_fallback = complete_solution(
+        model, guess, settings=settings, session=session
+    )
     completion_seconds = time.perf_counter() - completion_start
+
+    if config.polish_options is not None:
+        polished = polish_guess(
+            model,
+            guess,
+            config,
+            session=session,
+            warmstart=not used_fallback,
+            baseline_objective=info.objective,
+            **config.polish_options,
+        )
+        # Taken either way: a failed polish returns the guess untouched apart
+        # from the notes recording the attempt, which is what a sweep needs.
+        guess = polished.guess
+        if polished.succeeded:
+            # The sub-MIP optimises dispatch against the schedule it chose,
+            # over the *unrelaxed* model, so its objective is the polished
+            # guess's completion objective — and a fallback completion's
+            # understated one is superseded rather than merely repeated.
+            info, used_fallback = polished.info, False
+        completion_seconds += polished.seconds
 
     shed_mwh = float(sum(var.value or 0.0 for var in model.shed.values()))
     shed_cost = shed_mwh * config.voll

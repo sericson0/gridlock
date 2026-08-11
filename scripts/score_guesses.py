@@ -30,6 +30,7 @@ this file:
     --variant lp                          # heuristic 'lp', default options
     --variant ens=ensemble                # labelled, no options
     --variant e3=ensemble:{"soft_min_up_hours":3}
+    --variant pol=lp:{"polish":true}      # sub-MIP polish on top of the guess
 """
 
 from __future__ import annotations
@@ -51,8 +52,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_weekly import slice_hours  # noqa: E402  (sibling script, same directory)
 
 
-def parse_variant(spec: str) -> tuple[str, str, dict]:
-    """``[name=]heuristic[:json]`` -> (name, heuristic, options)."""
+def parse_variant(spec: str) -> tuple[str, str, dict, dict | None]:
+    """``[name=]heuristic[:json]`` -> (name, heuristic, options, polish).
+
+    ``polish`` is the one option that configures the *run* rather than the
+    guess builder, so it is lifted out of the builder's kwargs here: ``true``
+    enables the sub-MIP polish with its defaults, an object overrides them
+    (``{"polish":{"screen":"entry","seconds":60}}``).
+    """
     name, _, rest = spec.partition("=")
     if not rest:
         name, rest = spec, spec
@@ -63,15 +70,23 @@ def parse_variant(spec: str) -> tuple[str, str, dict]:
         raise SystemExit(f"--variant {spec!r}: options are not valid JSON ({error})")
     if not isinstance(options, dict):
         raise SystemExit(f"--variant {spec!r}: options must be a JSON object")
-    return name, heuristic.strip(), options
+    polish = options.pop("polish", None)
+    if polish is True:
+        polish = {}
+    if polish is not None and not isinstance(polish, dict):
+        raise SystemExit(f"--variant {spec!r}: 'polish' must be true or an object")
+    return name, heuristic.strip(), options, polish
 
 
-def make_config(args: argparse.Namespace, heuristic: str, options: dict) -> RunConfig:
+def make_config(
+    args: argparse.Namespace, heuristic: str, options: dict, polish: dict | None = None
+) -> RunConfig:
     return RunConfig(
         unit_commitment=True,
         cyclic=True,
         heuristic=heuristic,
         heuristic_options=options,
+        polish_options=polish,
         tight_generation_limits=args.tight,
         tight_ramp_limits=args.tight,
         voll=args.voll,
@@ -94,8 +109,11 @@ def score_week(
     bound = reference.notes["lp_objective"]
 
     rows = []
-    for name, heuristic, options in variants:
-        config = make_config(args, heuristic, options)
+    for name, heuristic, options, polish in variants:
+        config = make_config(args, heuristic, options, polish)
+        # The polish improves a guess rather than building one, so a polished
+        # 'lp' variant reuses the shared relaxation too — which is what makes
+        # the run-time difference between the two read as the polish's own.
         reuse = reference if (heuristic == "lp" and not options) else None
         try:
             score = score_guess(
@@ -126,7 +144,15 @@ def score_week(
             f"  on-hrs {score.committed_unit_hours:7.0f}"
             f"  starts {score.startups:4.0f}"
             f"  {score.guess_seconds + score.completion_seconds:6.1f}s"
-            f"{'  [FALLBACK]' if score.used_fallback else ''}",
+            # The polish's own cost, separately: a variant that clears the
+            # threshold but costs more than the solve it saves is a negative
+            # result, and the total above cannot show that.
+            + (
+                f" (polish {score.notes['polish_seconds']:.1f}s)"
+                if "polish_seconds" in score.notes
+                else ""
+            )
+            + ("  [FALLBACK]" if score.used_fallback else ""),
             flush=True,
         )
     return rows
