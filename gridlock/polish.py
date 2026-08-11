@@ -45,7 +45,7 @@ from .config import RunConfig, SolverSettings
 from .heuristics import CommitmentGuess, complete_solution
 from .solver import HighsSession, SolveInfo
 
-SCREENS = ("unit", "entry")
+SCREENS = ("entry", "unit")
 
 # Defaults chosen against what the polish is trying to buy, not for their
 # own sake. The threshold sits ``mip_gap/(1-mip_gap)`` above the LP bound —
@@ -77,14 +77,19 @@ class PolishResult:
 
 
 def screen_mask(
-    guess: CommitmentGuess, screen: str = "unit", neighbourhood: int = 0
+    guess: CommitmentGuess, screen: str = "entry", neighbourhood: int = 0
 ) -> pd.DataFrame:
     """Which entries the sub-MIP pins; everything else is left integral.
 
     ``entry`` pins exactly what the guess vouches for. ``unit`` pins only
     units the guess vouches for in *every* hour, freeing a contested unit's
-    whole column — which on these instances is most of the model, since a
-    single fractional hour condemns all 168.
+    whole column. The 12-week study prefers the unit screen for *fixings*,
+    because it is 7x safer where being wrong is permanent — but nothing here
+    is permanent, every pin is released, so the criterion is size rather
+    than safety and it points the other way: on RTS-GMLC week00 the unit
+    screen frees 3,192 binaries (26%) against the entry screen's 601 (4.9%),
+    and the sub-MIP reaches 0-2 nodes either way. ``entry`` is the default
+    for that reason.
 
     ``neighbourhood`` is the middle ground, and the one the structure of
     the error argues for: a commitment mistake is rarely an isolated hour,
@@ -126,7 +131,7 @@ def polish_guess(
     guess: CommitmentGuess,
     config: RunConfig,
     session: HighsSession | None = None,
-    screen: str = "unit",
+    screen: str = "entry",
     neighbourhood: int = 0,
     seconds: float = _DEFAULT_SECONDS,
     gap: float = _DEFAULT_GAP,
