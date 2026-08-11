@@ -32,6 +32,17 @@ is the wrong scoreboard. The month01 guess matched 96.9% of commitments and
 still landed 2.38% above the threshold. Optimise the margin, report the
 match percentage as colour.
 
+**But the margin is a sufficient condition, not a difficulty predictor.**
+The seed experiment above holds one model fixed and varies only the start,
+and within that comparison it is decisive. *Across* instances it ranks
+nothing — see the baseline below, where the two weeks that solved at one
+node had *worse* margins (3.4%, 5.0%) than two that timed out (1.5%,
+2.4%). What differs is whether HiGHS's root loop can close the gap on its
+own from whatever start it is given. Our start matters only on the weeks
+where it cannot — which are exactly the slow weeks, so the target is still
+right, but a low margin on an easy week buys nothing and cross-week margin
+comparisons mean nothing.
+
 ## What the guess gets wrong
 
 Comparing the delivered guess against the solved schedule across all 12
@@ -63,8 +74,9 @@ recovers.
 
 ## Step 0 — instrumentation (done)
 
-Guess quality was previously unmeasurable without solving the MIP. It is
-now a ~20 second LP. `RunResults.window_stats` carries, per window:
+Guess quality was previously unmeasurable without solving the MIP. It now
+costs one LP plus one completion — 45–90 s on RTS-GMLC at 168 h, against
+solves of 270–1,200 s+. `RunResults.window_stats` carries, per window:
 
 | column | meaning |
 |---|---|
@@ -80,13 +92,15 @@ now a ~20 second LP. `RunResults.window_stats` carries, per window:
 
 Three notes on reading them:
 
-- **The reported margin is conservative.** It uses the LP relaxation, which
-  is knowable *before* the solve — that is the point, since it lets a guess
-  be scored without solving anything. HiGHS's real root bound is the LP
-  plus whatever its cut loop adds, and that lift is not small: 0.48% on the
-  example system, which turned a true margin of 2.19% into a reported
-  2.68%. Grade retrospectively against `root_bound`; steer prospectively
-  against `heuristic_threshold_margin`.
+- **The reported margin is conservative, but barely so on RTS-GMLC.** It
+  uses the LP relaxation, which is knowable *before* the solve — that is
+  the point, since it lets a guess be scored without solving anything.
+  HiGHS's real root bound is the LP plus whatever its cut loop adds. On the
+  example system that lift is 0.48%, enough to turn a true margin of 2.19%
+  into a reported 2.68%; on RTS-GMLC it is 0.012–0.056% across six weeks,
+  so the two margins agree to within 0.06 points. Grade retrospectively
+  against `root_bound` anyway — it is free — but the conservatism is not a
+  practical obstacle on the real system.
 - **`mip_start_status` exists to catch a silent failure.** A completion
   that had to relax the minimum-output rows produces a start HiGHS rejects,
   and a rejected start leaves no trace in the objective or the node count —
@@ -104,6 +118,52 @@ Also fixed in passing: `lp_relaxation_guess` and `similar_days_guess` built
 their sub-configs without `config.voll`, so a non-default VOLL left the LP
 pricing unserved energy differently from the MIP it is supposed to bound.
 That would have made the threshold arithmetic invalid.
+
+## Baseline
+
+Six RTS-GMLC weeks spread across the year, `heuristic=lp`, `fixing=off`,
+`mip_gap=0.005`, 1,200 s limit, sequential on an otherwise idle machine
+(`results/weekly/rts_gmlc_margin/`):
+
+| week | margin | margin vs `root_bound` | cut lift | nodes | wall | end gap | termination |
+|---|---|---|---|---|---|---|---|
+| 00 | +2.384% | +2.341% | 0.042% | 247 | 1,293 s | 1.32% | time limit |
+| 09 | +1.533% | +1.477% | 0.056% | 420 | 1,275 s | 0.96% | time limit |
+| 18 | +5.421% | +5.389% | 0.031% | 754 | 1,269 s | 2.72% | time limit |
+| 26 | +3.440% | +3.425% | 0.014% | **1** | 388 s | 0.28% | optimal |
+| 35 | +5.034% | +5.021% | 0.012% | **1** | 271 s | 0.28% | optimal |
+| 44 | +56.04% | +55.98% | 0.033% | 911 | 1,249 s | 1.15% | time limit |
+
+Four observations, in descending order of consequence.
+
+**The metric reproduces the hand-run experiment.** Week00 covers hours
+0–167 — month01's segment — and scores +2.384% against the +2.38% that was
+previously established by manually reseeding the model three times. The
+automated number measures what the expensive experiment measured.
+
+**Margin does not rank weeks by difficulty** (see the caveat above). Weeks
+26 and 35 solved at one node from starts 3.4% and 5.0% out; weeks 00 and 09
+timed out from 2.4% and 1.5%. HiGHS's first feasible incumbent is our start
+in all six cases, so the warm start is always taken; what varies is whether
+the root loop can improve on it unaided. On weeks 26/35 it closed to 0.28%
+without branching. On the other four it could not.
+
+**Week44's +56% is one bug, and step 0 found it.** Its completion sheds
+259 MWh — $2.59 M at VOLL, which is 55 of the 56 points. Net of shed it is
++0.85%, ordinary. The schedule itself is fine (98.3% match, 1,414 committed
+unit-hours against the optimum's 1,421), and no unit at any shedding node
+was left off in an hour the optimum had it on, so this is not a missing
+commitment. `enforce_adequacy` passed it: that test is static, per hour, and
+bounds imports by *total incident line capacity*, which assumes the rest of
+the system can spare it. Feasibility of the fixed-commitment dispatch also
+needs ramps, simultaneous network flow and storage to work out, and on six
+hours of week44 they do not. See 1f.
+
+**Four of six weeks never reached the 0.5% tolerance in 1,200 s**, so the
+node and wall columns are censored and are a weak baseline for measuring
+track 1 against. Margins are unaffected — they are computed before the
+solve. Re-run the timing baseline at a longer limit when a candidate is
+ready to be measured.
 
 ## Track 1 — structure
 
@@ -137,6 +197,19 @@ duality gap, which is the right order of magnitude for the threshold.
 add symmetry-ordering rows `u[i,t] >= u[i+1,t]` within the 32 chains of
 units identical on node and every parameter. Unlike a better guess, this
 also shrinks the search itself.
+
+**1f. Shed-driven adequacy repair.** `enforce_adequacy` estimates whether a
+schedule *can* serve load; the completion LP *knows*. Read the shed off the
+completed solution, commit more units at the shedding node-hours (cheapest
+available locally first), re-complete, repeat two or three times. That
+replaces a static optimistic bound with the dispatch problem's own verdict,
+and it costs one extra LP per iteration. On week44 it is worth 55 points of
+margin on its own — the largest single defect the baseline exposed, and the
+only one that is a correctness *risk* rather than a quality one: with
+`fixing=off` a shedding completion merely wastes the warm start, but a
+screen that pinned such entries would hand the MIP a schedule that must
+shed. The 12-week study's certain-mask happened not to cover the offending
+hours here, which is luck rather than a guarantee.
 
 **1e. `deep_money >= 0.95` prescreen.** Units whose net load exceeds all
 cheaper capacity plus their own output for ≥95% of hours commit all week:
@@ -230,7 +303,7 @@ on the example system, so it is doing real work.
 | step | work | why here |
 |---|---|---|
 | 0 | threshold + margin + start-acceptance instrumentation | **done** — makes everything below measurable in seconds |
-| 1 | decommit pass (1a) → DP rounding (1b) → price iteration (1c) | attacks the one confirmed defect; no ML, no new data |
+| 1 | shed repair (1f) → decommit pass (1a) → DP rounding (1b) → price iteration (1c) | 1f first: it is the largest measured defect and the only safety one |
 | 2 | sub-MIP polish (3a) + portfolio (3d) + lift the 3c restriction | the named ceiling candidate, built from existing parts |
 | 3 | canonicalization (2a) → confidence model (2b) → kNN (2c) | trains on the 12 weeks already on disk |
 | 4 | data generation (2f) → sequence model (2d) → GNN (2e) | only if 1–3 leave the threshold uncleared |
@@ -251,3 +324,5 @@ Steps 1 and 2 are independent and can proceed in parallel.
   0.5%-gap incumbents, not proven optima.
 - The 61.7x month01 result used an oracle start lifted from an earlier
   solve. It is the ceiling this plan aims at, not a result already achieved.
+- The six-week baseline ran with a 1,200 s limit, which four weeks hit. Its
+  node and wall figures are lower bounds on the work those weeks need.
