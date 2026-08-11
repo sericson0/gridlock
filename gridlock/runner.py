@@ -24,6 +24,8 @@ from .heuristics import (
     apply_soft_budget,
     build_guess,
     complete_solution,
+    gap_threshold_objective,
+    hot_start_margin,
     match_fraction,
 )
 from .model import InitialState, build_model
@@ -40,6 +42,17 @@ class RunResults:
     timings, termination, objective/bound and every
     :class:`~gridlock.profiling.SolveMetrics` field (problem size,
     iterations, nodes, presolve detail in profile mode).
+
+    On a heuristic run it also carries the warm start's score:
+    ``heuristic_completion_objective`` (what the guessed schedule actually
+    costs, once dispatch is optimised against it),
+    ``heuristic_threshold_objective`` (the incumbent that would end the
+    solve at the root) and ``heuristic_threshold_margin`` (the fractional
+    distance between them — **at or below zero is a one-node solve**). Those
+    three are the scoreboard for guess quality; ``heuristic_match_pct``
+    is not, because share-of-binaries-correct and objective distance come
+    apart badly. ``mip_start_status`` records whether HiGHS accepted the
+    start at all, and needs ``config.profile`` since it is read from the log.
     ``component_stats`` is a per-component size census of the first
     window's Pyomo model (see :func:`gridlock.profiling.model_stats`).
     ``system`` is the system as actually modeled — the same object that
@@ -193,6 +206,7 @@ def run(
         heuristic_seconds = heuristic_fallback = heuristic_fixed = None
         heuristic_soft = 0
         completion_failed = False
+        completion_objective = None
         session = None
         if guess is not None:
             # One session serves completion and main solve, so the model is
@@ -201,7 +215,10 @@ def run(
             session = HighsSession(model)
             completion_start = time.perf_counter()
             try:
-                _, heuristic_fallback = complete_solution(model, guess, session=session)
+                completion_info, heuristic_fallback = complete_solution(
+                    model, guess, session=session
+                )
+                completion_objective = completion_info.objective
                 heuristic_fixed = apply_fixing(model, guess, config.heuristic_fixing)
                 heuristic_soft = apply_soft_budget(
                     model, guess, config.soft_fixing_budget
@@ -275,6 +292,29 @@ def run(
         frames = extract_window(model, system, kept_hours, duals)
         extract_seconds = time.perf_counter() - extract_start
         collected.append(frames)
+
+        # Score the warm start against the number that actually governs
+        # solve time: the incumbent at which the configured gap closes
+        # against the root bound (see heuristics.gap_threshold_objective).
+        # Only the LP-based guesses carry a bound to measure against.
+        lp_bound = None if guess is None else guess.notes.get("lp_objective")
+        threshold = (
+            None
+            if lp_bound is None
+            else gap_threshold_objective(lp_bound, config.solver.mip_gap)
+        )
+        # A completion that had to relax the minimum-output rows solved a
+        # weaker model, so its objective understates what the guessed
+        # schedule really costs. Reporting a margin from it would be
+        # optimistic in exactly the direction that misleads, so the margin
+        # is withheld; the raw objective stays, flagged by
+        # ``heuristic_fallback``.
+        margin = (
+            None
+            if heuristic_fallback
+            else hot_start_margin(completion_objective, lp_bound, config.solver.mip_gap)
+        )
+
         row = {
             "window": index,
             "first_hour": kept_hours[0],
@@ -290,6 +330,10 @@ def run(
             "heuristic_soft_vars": heuristic_soft,
             "heuristic_fallback": heuristic_fallback,
             "heuristic_completion_failed": completion_failed,
+            "heuristic_completion_objective": completion_objective,
+            "heuristic_lp_bound": lp_bound,
+            "heuristic_threshold_objective": threshold,
+            "heuristic_threshold_margin": margin,
             "heuristic_match_pct": (
                 None if guess is None else match_fraction(model, guess)
             ),

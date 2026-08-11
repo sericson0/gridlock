@@ -63,6 +63,59 @@ FIXING_MODES = ("off", "screen", "aggressive")
 # Availability below this is treated as an outage hour when stacking.
 _OUTAGE_TOL = 0.05
 _TOL = 1e-6
+# HiGHS's own default for mip_rel_gap, used when SolverSettings leaves it unset.
+_DEFAULT_MIP_GAP = 1e-4
+
+
+# --------------------------------------------------------------------------
+# Scoring a guess: how close is it to ending the solve at the root?
+# --------------------------------------------------------------------------
+
+
+def gap_threshold_objective(lp_bound: float, mip_gap: float | None) -> float:
+    """The incumbent value at which ``mip_gap`` closes against ``lp_bound``.
+
+    A branch-and-bound run stops as soon as ``(incumbent - bound) /
+    incumbent <= mip_gap``, so an incumbent at or below ``lp_bound / (1 -
+    mip_gap)`` proves the tolerance against the *root* bound and the solve
+    ends at one node. That threshold, not model size, is what governs
+    solve time here: on RTS-GMLC month01 a start 2.38% above it took 1,560
+    nodes and 1,732 s, one 0.11% above took 197 nodes and 873 s, and one
+    0.04% *below* took a single node and 28 s. There is no gradient — a
+    guess either clears this number or pays the full cost of lifting the
+    bound to meet it.
+
+    ``lp_bound`` should be the LP relaxation's objective (which
+    :func:`lp_relaxation_guess` records as ``lp_objective``). HiGHS's
+    actual root bound is that value *plus* whatever its cut loop adds, so
+    the threshold computed here is the conservative one: clearing it is
+    sufficient, and a guess that misses it narrowly may still terminate at
+    the root.
+    """
+    gap = _DEFAULT_MIP_GAP if mip_gap is None else float(mip_gap)
+    if not 0.0 <= gap < 1.0:
+        raise ValueError(f"mip_gap must be in [0, 1), got {gap}")
+    return lp_bound / (1.0 - gap)
+
+
+def hot_start_margin(
+    objective: float | None, lp_bound: float | None, mip_gap: float | None
+) -> float | None:
+    """How far a warm start sits from ending the solve at the root node.
+
+    ``(objective - threshold) / threshold``: **negative or zero means the
+    start already proves the gap** and the search is over before it starts;
+    positive is the fraction of objective the guess still has to give back.
+    This is the number to optimise when building a better guess — share of
+    commitment variables predicted correctly is not, since a 96.9%-correct
+    schedule still landed 2.38% above the threshold.
+
+    Returns None when either input is missing or the bound is not usable.
+    """
+    if objective is None or lp_bound is None or lp_bound <= 0.0:
+        return None
+    threshold = gap_threshold_objective(lp_bound, mip_gap)
+    return objective / threshold - 1.0
 
 
 @dataclass
@@ -624,6 +677,9 @@ def similar_days_guess(
         unit_commitment=True,
         tight_generation_limits=config.tight_generation_limits,
         tight_ramp_limits=config.tight_ramp_limits,
+        # A representative day priced at a different VOLL would trade load
+        # shedding against commitment on terms the real model never offers.
+        voll=config.voll,
     )
     settings = SolverSettings(
         mip_gap=representative_gap, time_limit=representative_time_limit
@@ -733,6 +789,11 @@ def lp_relaxation_guess(
         cyclic=config.cyclic,
         tight_generation_limits=config.tight_generation_limits,
         tight_ramp_limits=config.tight_ramp_limits,
+        # Unserved energy has to cost the same here as in the model this
+        # guess seeds. Leaving it at the default would relax a *different*
+        # objective, and the resulting ``lp_objective`` would not bound the
+        # MIP -- which is exactly what gap_threshold_objective assumes.
+        voll=config.voll,
     )
     # ``initial`` must be forwarded: build_model reads cyclic-ness from it
     # (``cyclic = initial is None``), so omitting it would relax the oracle

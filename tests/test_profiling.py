@@ -113,6 +113,40 @@ def test_parse_mip_log():
     assert parsed["rhs_coef_max"] == pytest.approx(100.0)
 
 
+MIP_START_ACCEPTED_LOG = """
+MIP start solution is feasible, objective value is 5814077.94232
+Solving MIP model with:
+   100 rows; 50 cols (5 binary...
+"""
+
+MIP_START_REJECTED_LOG = """
+User-supplied solution has with objective 1.2e+07 has violations: bound = 0; integrality = 0; row = 4.5
+User-supplied values of discrete variables cannot yield feasible solution
+Solving MIP model with:
+   100 rows; 50 cols (5 binary...
+"""
+
+
+def test_parse_mip_start_accepted():
+    parsed = parse_highs_log(MIP_START_ACCEPTED_LOG)
+    assert parsed["mip_start_status"] == "feasible"
+    assert parsed["mip_start_objective"] == pytest.approx(5814077.94232)
+
+
+def test_parse_mip_start_rejected():
+    """A complaint with no verdict line is the rejection signal."""
+    parsed = parse_highs_log(MIP_START_REJECTED_LOG)
+    assert parsed["mip_start_status"] == "rejected"
+    assert parsed["mip_start_objective"] is None
+
+
+def test_parse_mip_start_absent_is_none():
+    """No start supplied must read as 'not observed', never as rejected."""
+    parsed = parse_highs_log(MIP_LOG)
+    assert parsed["mip_start_status"] is None
+    assert parsed["mip_start_objective"] is None
+
+
 def test_parse_lp_log():
     parsed = parse_highs_log(LP_LOG)
     assert parsed["presolved_rows"] == 0

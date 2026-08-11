@@ -104,6 +104,23 @@ class SolveMetrics:
     first_feasible_seconds: float | None = None
     first_feasible_objective: float | None = None
     final_cuts_in_lp: int | None = None
+    # What HiGHS did with a supplied MIP start. Silence here is the trap
+    # this exists to catch: a start HiGHS rejects (because the completion
+    # had to relax rows to build it, say) leaves no trace in the objective
+    # or the node count, so the run measures a cold solve wearing a warm
+    # start's name. ``mip_start_objective`` is HiGHS's own reading of the
+    # start it accepted, which is the number to compare against the
+    # threshold in :func:`gridlock.heuristics.hot_start_margin`.
+    mip_start_status: str | None = None
+    mip_start_objective: float | None = None
+    # The bound at the end of the root loop, i.e. the LP relaxation plus
+    # whatever the cut loop added. This is the number a warm start is
+    # really racing: clearing ``root_bound / (1 - gap)`` ends the solve at
+    # one node. The LP relaxation alone gives a conservative stand-in that
+    # is available *before* the solve (which is why the runner scores
+    # against it); this one is exact but only knowable afterwards, so it
+    # is the honest yardstick when grading a guess retrospectively.
+    root_bound: float | None = None
     # Progress-table rows as a JSON list of dicts (time, bound, sol, gap,
     # cuts in LP, cumulative LP iterations, source tag) — the bound and
     # incumbent trajectory of the root loop, for research analysis.
@@ -237,6 +254,19 @@ _RE_LP_ITERS_KIND = {
     "lp_iters_separation": re.compile(r"(\d+)\s+\(separation\)"),
     "lp_iters_heuristics": re.compile(r"(\d+)\s+\(heuristics\)"),
 }
+# HiGHS's verdict on a supplied MIP start. It reports acceptance with the
+# start's objective; a rejection instead shows up as one of the complaint
+# lines, which carry no objective and are therefore recorded as status
+# alone. Anything the pattern doesn't recognise leaves the status None,
+# which means "not observed" -- never "rejected".
+_RE_MIP_START = re.compile(
+    r"MIP start solution is ([^,\n]+?),\s*objective value is\s+"
+    r"(-?[\d.]+(?:[eE][+-]?\d+)?)"
+)
+_RE_MIP_START_REJECTED = re.compile(
+    r"User-supplied (?:solution has .*violations"
+    r"|values of discrete variables cannot yield feasible solution)"
+)
 
 
 def _parse_count_suffix(raw: str) -> int:
@@ -277,7 +307,20 @@ def parse_mip_progress(text: str) -> dict:
         "first_feasible_objective": None,
         "final_cuts_in_lp": None,
         "mip_timeline_json": None,
+        "mip_start_status": None,
+        "mip_start_objective": None,
+        "root_bound": None,
     }
+
+    # HiGHS may complain about a start's violations and then repair it, so
+    # the explicit verdict wins wherever both appear; the complaint only
+    # stands in when no verdict was logged at all.
+    start = _RE_MIP_START.search(text)
+    if start:
+        out["mip_start_status"] = start.group(1).strip()
+        out["mip_start_objective"] = _parse_objective(start.group(2))
+    elif _RE_MIP_START_REJECTED.search(text):
+        out["mip_start_status"] = "rejected"
 
     timeline = []
     for match in _RE_MIP_PROGRESS.finditer(text):
@@ -305,6 +348,14 @@ def parse_mip_progress(text: str) -> dict:
                 out["first_feasible_seconds"] = row["time"]
                 out["first_feasible_objective"] = row["sol"]
                 break
+        # Root loop = every row logged before the first node was processed.
+        # Its last bound is what the cut loop achieved; on a one-node solve
+        # every row qualifies and this is simply the final bound.
+        root_rows = [
+            row for row in timeline if row["nodes"] == 0 and row["bound"] is not None
+        ]
+        if root_rows:
+            out["root_bound"] = root_rows[-1]["bound"]
 
     restarts = len(_RE_RESTART.findall(text))
     if timeline or restarts:

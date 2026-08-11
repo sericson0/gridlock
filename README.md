@@ -212,7 +212,7 @@ data/external/  third-party datasets cloned on demand (gitignored)
 benchmarks/     profile records land here (gitignored)
 scripts/        example-data generators; RTS-GMLC / NREL-118 importers
 tests/          pytest suite on tiny analytic systems
-docs/           mathematical formulation, profiling guide
+docs/           mathematical formulation, profiling guide, hot-start plan
 ```
 
 ## Tests

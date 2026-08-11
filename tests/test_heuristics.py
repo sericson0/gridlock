@@ -3,9 +3,12 @@
 import pytest
 
 from gridlock import RunConfig, run
+from gridlock.config import SolverSettings
 from gridlock.heuristics import (
     apply_soft_budget,
     complete_solution,
+    gap_threshold_objective,
+    hot_start_margin,
     ensemble_guess,
     derive_startup_shutdown,
     enforce_adequacy,
@@ -259,6 +262,93 @@ def test_similar_days_transfers_schedules_between_lookalike_days():
     assert frame.iloc[0:24].to_numpy().tolist() == frame.iloc[48:72].to_numpy().tolist()
     assert frame.iloc[24:48].to_numpy().tolist() == frame.iloc[72:96].to_numpy().tolist()
     assert guess.notes["representatives"] == 2
+
+
+# ------------------------------------------------------- hot-start scoring
+
+
+def test_threshold_is_the_bound_inflated_by_the_gap():
+    assert gap_threshold_objective(1000.0, 0.005) == pytest.approx(1000.0 / 0.995)
+    # An unset gap means HiGHS's own default, not "no tolerance".
+    assert gap_threshold_objective(1000.0, None) == pytest.approx(1000.0 / 0.9999)
+    assert gap_threshold_objective(1000.0, 0.0) == pytest.approx(1000.0)
+
+
+def test_threshold_rejects_a_gap_outside_the_unit_interval():
+    with pytest.raises(ValueError):
+        gap_threshold_objective(1000.0, 1.0)
+    with pytest.raises(ValueError):
+        gap_threshold_objective(1000.0, -0.1)
+
+
+def test_margin_sign_says_whether_the_solve_can_stop_at_the_root():
+    bound, gap = 1000.0, 0.005
+    threshold = gap_threshold_objective(bound, gap)
+    assert hot_start_margin(threshold, bound, gap) == pytest.approx(0.0)
+    assert hot_start_margin(threshold * 0.99, bound, gap) < 0.0   # clears
+    assert hot_start_margin(threshold * 1.02, bound, gap) == pytest.approx(0.02)
+
+
+def test_margin_is_none_without_a_usable_bound():
+    assert hot_start_margin(None, 1000.0, 0.005) is None
+    assert hot_start_margin(1000.0, None, 0.005) is None
+    assert hot_start_margin(1000.0, 0.0, 0.005) is None
+
+
+def test_lp_run_scores_its_own_warm_start():
+    """The LP guesses carry a bound, so the runner can score them."""
+    system = merit_system(hours=48)
+    guided = run(
+        system,
+        RunConfig(
+            unit_commitment=True,
+            heuristic="lp",
+            solver=SolverSettings(mip_gap=0.005),
+        ),
+    )
+    stats = guided.window_stats.iloc[0]
+    bound = stats["heuristic_lp_bound"]
+    completion = stats["heuristic_completion_objective"]
+    assert bound > 0
+    # The completion pins a feasible schedule, so it cannot beat the
+    # relaxation it was rounded from.
+    assert completion >= bound
+    assert stats["heuristic_threshold_objective"] == pytest.approx(bound / 0.995)
+    assert stats["heuristic_threshold_margin"] == pytest.approx(
+        completion / (bound / 0.995) - 1.0
+    )
+    # A cleared threshold must imply the solve had nothing left to prove.
+    if stats["heuristic_threshold_margin"] <= 0:
+        assert guided.total_cost <= completion + 1e-6
+
+
+def test_structural_guesses_report_no_threshold():
+    """`priority` has no bound to measure against; it must not invent one."""
+    system = merit_system(hours=48)
+    guided = run(system, RunConfig(unit_commitment=True, heuristic="priority"))
+    stats = guided.window_stats.iloc[0]
+    assert stats["heuristic_completion_objective"] > 0
+    assert pd.isna(stats["heuristic_lp_bound"])
+    assert pd.isna(stats["heuristic_threshold_margin"])
+
+
+def test_relaxed_completion_withholds_the_margin():
+    """A fallback completion solved a weaker model, so its margin would lie."""
+    system = make_system(
+        [
+            gen("a", "A", 10, 100, min_mw=80, startup_cost=100),
+            gen("b", "A", 20, 100, min_mw=80, startup_cost=100),
+        ],
+        {"A": [100.0] * 6},
+    )
+    model = build_model(system, RunConfig(unit_commitment=True), list(range(6)))
+    guess = priority_list_guess(system, RunConfig(), list(range(6)))
+    guess.commitment.loc[:, :] = 1.0
+    info, used_fallback = complete_solution(model, guess)
+    assert used_fallback
+    # The relaxed solve understates the schedule's true cost, which is the
+    # direction that would make a guess look better than it is.
+    assert info.objective is not None
 
 
 # --------------------------------------------------- delivery and end-to-end

@@ -286,6 +286,21 @@ def solve_week(
         "heuristic_fallback": bool(stats["heuristic_fallback"]),
         "heuristic_fixed_vars": _maybe_float(stats.get("heuristic_fixed_vars")),
         "heuristic_soft_vars": _maybe_float(stats.get("heuristic_soft_vars")),
+        # The hot-start scoreboard: what the guess costs, what it would
+        # have to cost to end the solve at the root, and the distance
+        # between them (<= 0 clears). See docs/hotstart-plan.md.
+        "completion_objective": _maybe_float(
+            stats.get("heuristic_completion_objective")
+        ),
+        "threshold_objective": _maybe_float(
+            stats.get("heuristic_threshold_objective")
+        ),
+        "threshold_margin": _maybe_float(stats.get("heuristic_threshold_margin")),
+        "mip_start_status": _maybe_str(stats.get("mip_start_status")),
+        "mip_start_objective": _maybe_float(stats.get("mip_start_objective")),
+        # The exact yardstick, knowable only after the fact: the LP bound
+        # plus whatever HiGHS's root cut loop added.
+        "root_bound": _maybe_float(stats.get("root_bound")),
         "simplex_iterations": _maybe_float(stats.get("simplex_iterations")),
         "mip_nodes": _maybe_float(stats.get("mip_nodes")),
         "highs_run_seconds": _maybe_float(stats.get("highs_run_seconds")),
@@ -336,6 +351,18 @@ def _maybe_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _maybe_str(value) -> str | None:
+    """Like :func:`_maybe_float` for the one column that is text.
+
+    A missing ``mip_start_status`` arrives from pandas as NaN, which would
+    otherwise be written to JSON as the string "nan" and read back as a
+    status HiGHS never reported.
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    return str(value)
 
 
 def main() -> int:
