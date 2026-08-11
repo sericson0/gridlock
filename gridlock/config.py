@@ -141,6 +141,16 @@ class RunConfig:
         reductions, solve-phase timings and coefficient ranges to
         ``RunResults.window_stats``. Basic metrics (problem size,
         iterations, nodes, HiGHS run time) are collected regardless.
+    heuristic_repair
+        With an LP-based ``heuristic``, hand the rounded schedule to
+        :func:`gridlock.repair.repair_guess` before delivering it: repair
+        the unserved energy the completion LP actually reports, then unwind
+        the pipeline's monotone over-commitment by cutting the committed
+        hours that lose money at the completion's own prices. True for
+        defaults, or a dict of that function's keyword arguments
+        (``{"decommit": False}`` for the safety pass alone). Costs a bounded
+        number of extra LP solves and defaults to False so recorded
+        baselines stay comparable.
     """
 
     unit_commitment: bool = True
@@ -160,6 +170,7 @@ class RunConfig:
     voll: float = 10_000.0
     profile: bool = False
     solver: SolverSettings = field(default_factory=SolverSettings)
+    heuristic_repair: bool | dict = False
 
     def validate(self) -> None:
         if self.num_hours is not None and self.num_hours < 1:

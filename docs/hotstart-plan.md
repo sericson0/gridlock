@@ -175,6 +175,25 @@ fixed-vars tax is gone (a re-solve is ~0.1–1 s, not ~1,000 s). This is the
 smallest change with the largest expected effect, because it attacks the
 one defect that has actually been measured.
 
+*Done* (`gridlock/repair.py`, `heuristic_repair`), but the ranking above
+had to be rewritten twice before it bought anything. Whole-run removal was
+refused on **every** candidate across weeks 00/09/44, shedding 100–5,000
+MWh each time: a run that loses money averaged over 168 h is still
+load-carrying in its peak hours. And priced on duals alone essentially the
+whole committed fleet reads as waste, because LP energy prices never
+recover no-load cost — the standard non-convexity — so the ranking
+cheerfully proposed cutting 144 of a 168-hour run. What works is (i) cuts
+that grow inward from one end of a run and stop at the first hour that pays
+for itself, since "extended runs, not extra starts" means the money is in
+the shoulders, and (ii) screening a candidate hour against the rest of the
+fleet's ramp-limited headroom before proposing it. On top of 1f that is
+worth 0.55–0.98 points of margin per week for ~24 LP re-solves — week00
++1.851% → +0.891%, week09 +1.533% → +0.981%, week44 +2.523% → +1.542%,
+and it hands week44 back all 51 of the unit-hours 1f spent. Note it
+also cuts startups hard (week09 45 → 32) — further in the direction the
+census above says is *already* 4.6% low, so the objective improves while
+that statistic moves away from the optimum's.
+
 **1b. Per-unit DP instead of round-and-repair.** The principled version of
 1a. Take nodal prices from the LP duals (`want_duals` is already plumbed
 through `HighsSession.solve`, just unused on the LP path) and solve each
@@ -210,6 +229,16 @@ only one that is a correctness *risk* rather than a quality one: with
 screen that pinned such entries would hand the MIP a schedule that must
 shed. The 12-week study's certain-mask happened not to cover the offending
 hours here, which is luck rather than a guarantee.
+
+*Done* (`gridlock/repair.py`, `heuristic_repair`), and it is the largest
+single win measured so far. Week44's 259 MWh goes to zero for 12 committed
+unit-hours — 51 once the min up/down repair extends them — and one extra
+LP: **+56.036% → +2.523%**. Week00's 3.50 MWh goes for one unit-hour,
++2.384% → +1.851%. Week09 sheds nothing and the pass correctly does nothing
+to it, at a cost of one LP. Successive rounds widen the committed block
+around the failing hour (`[t-k, t+k]`), which is what handles shed that is
+a ramp shortfall rather than a capacity one; in practice one round at
+`k = 0` sufficed on both weeks.
 
 **1e. `deep_money >= 0.95` prescreen.** Units whose net load exceeds all
 cheaper capacity plus their own output for ≥95% of hours commit all week:

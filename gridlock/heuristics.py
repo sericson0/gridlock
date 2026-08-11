@@ -774,6 +774,7 @@ def lp_relaxation_guess(
     config: RunConfig,
     hours: list[int],
     initial: "InitialState | None" = None,
+    repair: "bool | dict | None" = None,
 ) -> CommitmentGuess:
     """Round the LP relaxation's commitment; trust the values it resolved.
 
@@ -782,6 +783,14 @@ def lp_relaxation_guess(
     full-horizon LP solve, so at annual scale it costs what the LP costs.
     Confidence is exactly integrality: fractional values — the genuinely
     contested commitments — stay uncertain.
+
+    ``repair`` hands the rounded schedule to
+    :func:`gridlock.repair.repair_guess`, which replaces this module's
+    static capacity estimates with the completion LP's verdict: unserved
+    energy is repaired by committing where the dispatch actually failed, and
+    the monotone over-commitment is unwound by dropping runs that lose money
+    at the LP's own prices. True for defaults, a dict of that function's
+    keyword arguments to tune it; None reads ``config.heuristic_repair``.
     """
     start = time.perf_counter()
     lp_config = RunConfig(
@@ -823,7 +832,7 @@ def lp_relaxation_guess(
     # Anything adequacy or repair had to move is no longer an LP verdict.
     certain = certain & (rounded == values.round())
 
-    return CommitmentGuess(
+    guess = CommitmentGuess(
         name="lp",
         commitment=rounded,
         certain=certain,
@@ -838,6 +847,28 @@ def lp_relaxation_guess(
             "lp_seconds": lp_info.solve_seconds,
         },
     )
+    return _repair_if_asked(system, config, hours, guess, initial, repair)
+
+
+def _repair_if_asked(
+    system: SystemData,
+    config: RunConfig,
+    hours: list[int],
+    guess: CommitmentGuess,
+    initial: "InitialState | None",
+    repair: "bool | dict | None",
+) -> CommitmentGuess:
+    """Run the completion-driven repair passes, if this run wants them."""
+    if repair is None:
+        repair = config.heuristic_repair
+    if not repair:
+        return guess
+    # Imported here rather than at module scope: gridlock.repair builds on
+    # this module, so the dependency only runs in the direction of use.
+    from .repair import repair_guess
+
+    options = dict(repair) if isinstance(repair, dict) else {}
+    return repair_guess(system, config, hours, guess, initial=initial, **options)
 
 
 # --------------------------------------------------------------------------
@@ -851,6 +882,7 @@ def ensemble_guess(
     hours: list[int],
     initial: "InitialState | None" = None,
     soft_min_up_hours: int | None = None,
+    repair: "bool | dict | None" = None,
 ) -> CommitmentGuess:
     """Run all three heuristics and trust only what they agree on.
 
@@ -890,7 +922,7 @@ def ensemble_guess(
     carries_state = initial is not None and (
         bool(initial.commitment) or bool(initial.state_hours)
     )
-    lp = lp_relaxation_guess(system, config, hours, initial=initial)
+    lp = lp_relaxation_guess(system, config, hours, initial=initial, repair=repair)
     if carries_state:
         # priority and similar_days cannot honour a carried obligation, so
         # there is no ensemble to form. Degrade to the LP alone rather than
@@ -925,6 +957,12 @@ def ensemble_guess(
             continue
         certain &= guess.commitment.reindex_like(lp.commitment) == lp.commitment
         agreed += 1
+    if repair or (repair is None and config.heuristic_repair):
+        # The repair overruled the relaxation wherever the two disagree, on
+        # the completion's evidence rather than the LP's. Unit-level
+        # integrality still holds there, so the screen would keep vouching
+        # for a value that has since been withdrawn.
+        certain &= lp.commitment == values.round()
 
     soft = None
     if soft_min_up_hours is not None:
