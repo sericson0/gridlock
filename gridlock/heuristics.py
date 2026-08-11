@@ -55,6 +55,12 @@ import pyomo.environ as pyo
 from .config import RunConfig, SolverSettings
 from .data import SystemData
 from .model import InitialState, build_model
+from .rounding import (
+    dispatch_ceiling,
+    dp_commitment,
+    nodal_prices,
+    restrict_to_decommitments,
+)
 from .solver import HighsSession, SolveInfo
 
 HEURISTICS = ("priority", "similar_days", "lp", "ensemble")
@@ -774,6 +780,9 @@ def lp_relaxation_guess(
     config: RunConfig,
     hours: list[int],
     initial: "InitialState | None" = None,
+    dp_rounding: bool = False,
+    dp_output: str = "dispatch",
+    dp_scope: str = "all",
 ) -> CommitmentGuess:
     """Round the LP relaxation's commitment; trust the values it resolved.
 
@@ -782,7 +791,39 @@ def lp_relaxation_guess(
     full-horizon LP solve, so at annual scale it costs what the LP costs.
     Confidence is exactly integrality: fractional values — the genuinely
     contested commitments — stay uncertain.
+
+    ``dp_rounding`` replaces ``round()`` with the price-based single-unit
+    dynamic program in :mod:`gridlock.rounding`, which decides each unit's
+    schedule against the relaxation's own nodal prices instead of against
+    the 0.5 line. **It defaults to off because it currently loses**: the DP
+    decommits, and on RTS-GMLC the static adequacy test is not strong enough
+    to keep a decommitted schedule servable, so the delivered guess sheds.
+    That module records the measurement and what has to land first.
+
+    ``dp_output`` picks what a committed hour is valued at. ``"dispatch"``
+    caps it at the MW the relaxation actually ran the unit at
+    (:func:`~gridlock.rounding.dispatch_ceiling`); ``"capacity"`` values it
+    at the unit's own maximum, which is the textbook Lagrangian subproblem
+    and measurably the wrong question here — at a marginal price every unit
+    below the margin is profitable flat out, and on three RTS-GMLC weeks
+    that valuation committed more unit-hours than the relaxation it
+    discretised on every one of them, costing 3 to 11 points of margin.
+
+    ``dp_scope`` picks how much of the DP's answer is delivered:
+    ``"all"`` the whole schedule, ``"decommit"`` only where it commits less
+    than ``round()`` would, ``"contested"`` only where it commits less *and*
+    the relaxation left that entry fractional. Each step narrows it toward
+    the entries a single price vector can be trusted on (see
+    :func:`~gridlock.rounding.restrict_to_decommitments`).
     """
+    if dp_output not in ("dispatch", "capacity"):
+        raise ValueError(
+            f"unknown dp_output '{dp_output}' (available: dispatch, capacity)"
+        )
+    if dp_scope not in ("all", "decommit", "contested"):
+        raise ValueError(
+            f"unknown dp_scope '{dp_scope}' (available: all, decommit, contested)"
+        )
     start = time.perf_counter()
     lp_config = RunConfig(
         unit_commitment=False,
@@ -801,7 +842,9 @@ def lp_relaxation_guess(
     # and a guess that ignores carried min up/down obligations makes the
     # completion infeasible rather than merely inaccurate.
     lp_model = build_model(system, lp_config, hours, initial)
-    lp_info, _ = HighsSession(lp_model).solve(SolverSettings())
+    lp_info, duals = HighsSession(lp_model).solve(
+        SolverSettings(), want_duals=dp_rounding
+    )
 
     units = list(lp_model.G_UC)
     values = pd.DataFrame(
@@ -816,11 +859,42 @@ def lp_relaxation_guess(
     # Cyclic-ness is read the same way build_model reads it, so the repair
     # cannot disagree with the model about whether hour 0 wraps.
     cyclic = initial is None
-    rounded = repair_min_up_down(values.round(), system, cyclic)
+    dp_notes: dict = {}
+    if dp_rounding:
+        ceiling = None
+        if dp_output == "dispatch":
+            dispatch = pd.DataFrame(
+                {g: [lp_model.p[g, t].value for t in hours] for g in units},
+                index=hours,
+                dtype=float,
+            )
+            ceiling = dispatch_ceiling(values, dispatch)
+        discrete, dp_notes = dp_commitment(
+            system,
+            units,
+            hours,
+            nodal_prices(lp_model, duals, hours),
+            cyclic,
+            initial=initial,
+            fallback=values,
+            ceiling=ceiling,
+        )
+        if dp_scope != "all":
+            discrete = restrict_to_decommitments(
+                discrete,
+                values.round(),
+                contested=~certain if dp_scope == "contested" else None,
+            )
+        dp_notes["dp_output"] = dp_output
+        dp_notes["dp_scope"] = dp_scope
+    else:
+        discrete = values.round()
+    rounded = repair_min_up_down(discrete, system, cyclic)
     rounded, added = enforce_adequacy(rounded, system, hours)
     if added:
         rounded = repair_min_up_down(rounded, system, cyclic)
-    # Anything adequacy or repair had to move is no longer an LP verdict.
+    # Anything adequacy or repair had to move is no longer an LP verdict —
+    # and neither is anything the DP decided against the relaxation.
     certain = certain & (rounded == values.round())
 
     return CommitmentGuess(
@@ -836,6 +910,7 @@ def lp_relaxation_guess(
             # so this is the per-run integrality gap reference.
             "lp_objective": lp_info.objective,
             "lp_seconds": lp_info.solve_seconds,
+            **dp_notes,
         },
     )
 
