@@ -29,3 +29,6 @@ data/external/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Agent worktrees (transient; each is its own checkout)
+.claude/worktrees/
