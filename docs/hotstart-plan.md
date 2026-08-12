@@ -267,7 +267,81 @@ proof of optimality, the preprocessing pays even when the solve times out.
 And a strong incumbent makes nodes cheap — 14x the nodes in 3x the time on
 week00 — it just does not make the bound move.
 
+## Clustering restores branch-and-bound (measured)
+
+Weeks 0/9/44, repaired + polished starts, 0.5% gap, 3,600 s limit, with and
+without `cluster_units` (`results/weekly/rts_gmlc_cluster/`):
+
+| week | model | final | nodes | end gap | wall | termination |
+|---|---|---|---|---|---|---|
+| 00 | unclustered | 5,705,833 | 3,555 | 0.90% | 4,210 s | time limit |
+| 00 | clustered | 5,699,877 | 3,526 | 0.78% | 3,790 s | time limit |
+| 09 | unclustered | 6,549,442 | 3,820 | 0.74% | 3,774 s | time limit |
+| 09 | **clustered** | **6,527,681** | 2,836 | **0.40%** | **2,326 s** | **optimal** |
+| 44 | unclustered | 4,703,883 | 1,905 | 0.60% | 3,928 s | time limit |
+| 44 | **clustered** | **4,699,316** | **3** | **0.50%** | **645 s** | **optimal** |
+
+**Two of three timeouts become proven-optimal solves**, week44 in 645 s and
+three nodes against 3,928 s and 1,905.
+
+**The mechanism is primal, not dual.** The bound lift barely moves
+(0.074% → 0.091%, 0.105% → 0.114%, 0.102% → 0.102%). What changes is that
+the search can improve the incumbent again:
+
+| week | B&B gain, unclustered | B&B gain, clustered |
+|---|---|---|
+| 00 | 0.000% | 0.025% |
+| 09 | 0.000% | **0.622%** |
+| 44 | 0.000% | 0.000% (terminated at 3 nodes) |
+
+Week09 is the proof: its clustered start is *worse* (+0.639% against
++0.347%) and it still finishes optimal, because branch-and-bound closes
+0.622% that it could not touch at all on the unit-level model. With 24
+clusters covering 56 of 73 units, every improving move on the unit-level
+model has a factorial number of equivalent relabellings, so the search
+spends itself re-deriving schedules it has already seen. Remove the
+symmetry and the same effort finds genuinely new ones.
+
+This qualifies the bound-limited finding above rather than replacing it:
+the unit-level model is bound-limited *because* its incumbent search is
+paralysed by symmetry, not because the incumbent was already as good as it
+could get.
+
+**The clustered answers are exact, verified three ways.** Clustering is
+documented as a relaxation (a cluster can shift ramp capability between
+members), and the clustered costs come in 0.10–0.33% *below* the
+unclustered ones — precisely the signature a relaxation would leave. It is
+not one here. Every clustered MIP answer replays on the unit-level model at
+the same cost to the cent (6,527,680.85 / 4,699,316.49 / 5,699,876.75),
+with zero shed and no relaxed-row fallback.
+
+Getting that right needed the correct disaggregation, and the obvious one
+is wrong. Splitting a count by *staircase* (member k on wherever the count
+reaches k) leaves members violating their own min-up rows and reads as a
+relaxation that isn't there. The aggregate min-up row states that the units
+started in the last UT hours never outnumber those running now, so the
+recent starters can always be placed among the running units — provided the
+member retired is the longest-serving one. A FIFO assignment does that and
+produces zero violations on every cluster of both weeks tested.
+
+Exactness follows from the clustering *key*: `cluster_identical_units`
+pools only units agreeing on every parameter, at the same node, with the
+same availability profile. For exactly identical units the optimal dispatch
+splits evenly and the aggregate ramp row is the sum of the per-unit rows.
+Loosen that key to pool near-identical units and the relaxation becomes
+real immediately.
+
+**Open:** the decommit pass skips clusters, so with clustering on it sees
+17 of 73 units, and `rep` alone is 0.55 points worse on weeks 00/09. The
+polish substitutes for it (it is a MIP over integer counts and can lower
+one), which is why `rep_pol` still wins on 00 and 44 — week09 is where the
+substitution fails. A cluster-aware decommit drops the top layer over a
+run's shoulder, priced at `no_load - (price - mc)*(p/u)` per member. Also
+unbuilt: nothing converts a clustered result frame back to unit-level
+schedules, which the FIFO routine would supply.
+
 ## Track 1 — structure
+
 
 
 
