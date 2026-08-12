@@ -207,6 +207,10 @@ def solve_week(
         heuristic=args.heuristic,
         heuristic_fixing=args.fixing,
         heuristic_options=options,
+        # The two post-guess passes, off by default so the recorded
+        # baselines stay comparable. See docs/hotstart-plan.md.
+        heuristic_repair=args.repair,
+        polish_options={} if args.polish else None,
         soft_fixing_budget=args.soft_budget,
         tight_generation_limits=args.tight,
         tight_ramp_limits=args.tight,
@@ -409,6 +413,18 @@ def main() -> int:
         default=None,
         help="with --heuristic ensemble: units whose minimum up time is at or "
         "below this get the deviation budget rather than a fixing",
+    )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="repair the guess against its completion: commit where the "
+        "dispatch actually shed, then drop runs that lose money",
+    )
+    parser.add_argument(
+        "--polish",
+        action="store_true",
+        help="solve the contested core as a restricted MIP, release every "
+        "fixing, and start the real solve from the result",
     )
     parser.add_argument("--mip-gap", type=float, default=1e-4)
     parser.add_argument("--time-limit", type=float, default=1800.0)

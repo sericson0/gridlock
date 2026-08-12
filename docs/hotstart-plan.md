@@ -165,7 +165,57 @@ track 1 against. Margins are unaffected — they are computed before the
 solve. Re-run the timing baseline at a longer limit when a candidate is
 ready to be measured.
 
+## Composition (measured)
+
+The three tracks were built independently and then stacked. Weeks 0/9/44,
+`heuristic=lp`, 0.5% gap (`results/composition.csv`):
+
+| week | baseline | + repair (1f/1a) | **+ repair + polish (3a)** | + repair + DP (1b) |
+|---|---|---|---|---|
+| 00 | +2.384% | +0.891% | **+0.478%** | +1.051% |
+| 09 | +1.533% | +0.981% | **+0.347%** | +1.437% |
+| 44 | +56.036% | +1.542% | **+0.199%** | +4.267% |
+| mean | 19.984% | 1.138% | **0.341%** | 2.251% |
+
+**Repair and polish compose; they are not substitutes.** Polish alone
+reached +0.618% / +0.695% on weeks 00/09 and repair alone +0.891% /
++0.981%, but stacked they reach +0.478% / +0.347% — better than either,
+because they recover different money. The polish also gets *cheaper* on a
+repaired guess (322–417 s against 550–640 s standalone), since it starts
+from a feasible schedule instead of spending its budget rediscovering one.
+Committed unit-hours land at 1,911 on week00 against the relaxation's own
+fractional sum of 1,907.
+
+**The DP does not compose, and shed was not what was holding it back.**
+Its author inferred from net-of-shed figures that a working adequacy repair
+might flip the result. Measured, it does not: with shed at zero for both,
+the DP is worse than repair alone on all three weeks. On week44 it is
+worse by 2.7 points *and* commits more (1,516 unit-hours against 1,414,
+98 startups against 81) — the DP decommits, the schedule then cannot serve
+load, and the repair puts back more than the DP removed. The repair pass
+alone already beats the DP's net-of-shed score, so the DP's apparent edge
+was an artifact of comparing against an unrepaired baseline.
+
+**Nothing clears yet.** The best result is +0.199%. On RTS-GMLC the
+LP-derived threshold is conservative by only 0.03–0.06%, so the true
+margins are near these. Week00's `rep_pol` start costs ~5,705,900 against a
+schedule known to cost 5,676,660 — consistent with the entry screen
+excluding it (see 3a), which is the next thing to try.
+
+**Still unmeasured: whether any of this pays.** These are margins. The
+repair costs ~120–160 s and the polish a further ~320–420 s, against
+baseline solves that were themselves censored at 1,200 s. No MIP has been
+solved from a repaired or polished start, so there is no node count and no
+wall-clock. That is the next measurement, and it is the one that decides
+whether the preprocessing earns its keep.
+
+**One flag:** `rep_pol` on week44 leaves 0.08 MWh of shed where `rep` left
+zero. Negligible against the margin ($800), but it means the polish can
+undo the repair's feasibility guarantee — the sub-MIP is free to decommit
+and answers to its own dispatch, not to the repair's invariant.
+
 ## Track 1 — structure
+
 
 **1a. A decommitment pass.** The +2.7% bias has no counter-pass. Rank each
 committed run by `(no-load + startup) - LP dispatch surplus`, tentatively
