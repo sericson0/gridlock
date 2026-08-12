@@ -337,30 +337,47 @@ def _replaceable(
     hours: list[int],
     units: list[str],
 ) -> np.ndarray:
-    """hours x units: could the rest of the committed fleet cover this output?
+    """hours x units: could the rest of the fleet cover *one member's* output?
 
-    A screen, not a proof. It compares a unit's output against the headroom
-    the *other* committed units have in that hour, each capped at its own
-    ramp rate because the pick-up has to happen within the hour. It ignores
-    the network (optimistic) and storage (pessimistic), so it neither
-    guarantees nor forbids anything — the re-completion still decides. What
-    it does is stop the ranking proposing cuts that must obviously shed,
-    which on RTS-GMLC is otherwise most of them: LP energy prices never
-    recover a committed unit's no-load cost (the standard non-convexity), so
-    priced at duals alone almost every run in the fleet looks like waste.
+    A screen, not a proof. It compares the output of the single member a cut
+    would drop against the headroom every other committed unit has in that
+    hour, each capped at its own ramp rate because the pick-up has to happen
+    within the hour. It ignores the network (optimistic) and storage
+    (pessimistic), so it neither guarantees nor forbids anything — the
+    re-completion still decides. What it does is stop the ranking proposing
+    cuts that must obviously shed, which on RTS-GMLC is otherwise most of
+    them: LP energy prices never recover a committed unit's no-load cost
+    (the standard non-convexity), so priced at duals alone almost every run
+    in the fleet looks like waste.
+
+    A clustered row commits a *count*, and a cut drops one member of it, so
+    three quantities have to be read per member rather than per row: the
+    row's spare capacity is capped by what its ``u`` committed members can
+    ramp (not one), the member being dropped carries ``p/u`` of the row's
+    output (its members are identical by construction, so the share is
+    equal), and the ``u - 1`` members left behind count towards the headroom
+    that has to absorb it. A single unit is ``u = 1`` and reduces to the
+    original expression exactly.
     """
     gens = system.generators
     dispatch = completion.dispatch
-    schedule = commitment.loc[hours, units].to_numpy(dtype=float)
-    ceiling = np.array(
+    counts = commitment.loc[hours, units].to_numpy(dtype=float)
+    per_unit = np.array(
         [
             _availability(system, g, hours) * float(gens.at[g, "max_mw"])
             for g in units
         ]
     ).T
     ramp = np.array([float(gens.at[g, "ramp_rate_mw_per_hr"]) for g in units])
-    headroom = np.minimum(np.maximum(ceiling * schedule - dispatch, 0.0), ramp)
-    return headroom.sum(axis=1, keepdims=True) - headroom >= dispatch
+
+    row_headroom = np.minimum(
+        np.maximum(per_unit * counts - dispatch, 0.0), ramp * counts
+    )
+    share = np.divide(
+        dispatch, counts, out=np.zeros_like(dispatch), where=counts > 0.0
+    )
+    own_headroom = np.minimum(np.maximum(per_unit - share, 0.0), ramp)
+    return row_headroom.sum(axis=1, keepdims=True) - own_headroom >= share
 
 
 def _rank_cuts(
@@ -391,6 +408,25 @@ def _rank_cuts(
     eats through a run's valuable peak hours to reach cheap ones beyond
     them, and every such cut was refused on RTS-GMLC — 144 hours of a
     168-hour run, shedding 2,850 MWh.
+
+    **Clusters** commit a count, so "the run" is not one unit's history and
+    there is no single series to walk. The column is read as N *layers* —
+    layer k is on wherever the count reaches k — and each layer offers cuts
+    as the 0/1 series it now is, dropping one member over the hours taken.
+    That is the same decomposition
+    :func:`~gridlock.heuristics.repair_min_up_down` uses, for the same
+    reason: the model's cluster rows are the sum of N single-unit rows, so a
+    layer is the granularity at which min up/down actually reasons. Skipping
+    clusters instead — which this pass did until the layer machinery
+    existed — left it blind to 56 of RTS-GMLC's 73 units once
+    ``cluster_units`` was on, and cost 0.55 points of margin on two of three
+    weeks measured.
+
+    The per-layer bookkeeping is a *ranking* device, not a guarantee: after
+    one layer is trimmed the remaining layers are re-derived from the new
+    counts and need not be the ones reasoned about here. Nothing rests on
+    it, because every candidate is put to the completion and an infeasible
+    one is simply refused.
     """
     gens = system.generators
     node_index = {n: i for i, n in enumerate(nodes)}
@@ -403,12 +439,9 @@ def _rank_cuts(
     for g in commitment.columns:
         if g not in unit_column:
             continue
-        # A cluster commits a count, so "the run" is not one unit's history
-        # and cutting it would drop the whole fleet at that row. Left alone.
-        if float(gens.at[g, "num_units"]) > 1:
-            continue
-        series = commitment[g].to_numpy(dtype=float).round().astype(int)
-        if not series.any():
+        members = max(1, int(gens.at[g, "num_units"]))
+        counts = commitment[g].to_numpy(dtype=float).round().astype(int)
+        if not counts.any():
             continue
         no_load = float(gens.at[g, "no_load_cost"])
         startup = float(gens.at[g, "startup_cost"])
@@ -420,17 +453,35 @@ def _rank_cuts(
         column = unit_column[g]
 
         def hour_saving(i: int, node=node, column=column, no_load=no_load,
-                        marginal=marginal) -> float:
+                        marginal=marginal, counts=counts) -> float:
+            """What dropping one member for this hour saves, at LP prices.
+
+            It costs the fleet the member's no-load charge and loses the
+            margin its output earned. For a cluster the output in question
+            is the row's ``p/u`` share, not the row total — dropping one of
+            three committed members does not strand all three members' MW.
+            """
             if prices is None:
                 return no_load
-            return no_load - (prices[i, node] - marginal) * completion.dispatch[i, column]
+            u = counts[i]
+            share = completion.dispatch[i, column] / u if u else 0.0
+            return no_load - (prices[i, node] - marginal) * share
 
         def droppable(i: int, column=column) -> bool:
             return bool(replaceable[i, column]) and hour_saving(i) > 0.0
 
-        for start, length in _runs_of(series, 1, cyclic):
+        layer_runs = [
+            (layer, start, length)
+            for layer in range(1, members + 1)
+            for start, length in _runs_of((counts >= layer).astype(int), 1, cyclic)
+        ]
+        for layer, start, length in layer_runs:
             positions = tuple((start + k) % horizon for k in range(length))
-            run = (g, start, length)
+            # One cut per cluster per batch: two layers trimmed together
+            # would compose into a schedule neither of them checked, so they
+            # share a batch key and the better one wins. A single unit keeps
+            # its own run as the key, exactly as before.
+            run = (g, start, length) if members == 1 else (g, -1, -1)
             candidates = []
 
             if all(droppable(i) for i in positions):
@@ -489,8 +540,12 @@ def _without(commitment: pd.DataFrame, cuts: list[_Cut]) -> pd.DataFrame:
     values = candidate.to_numpy(dtype=float)
     column = {g: j for j, g in enumerate(candidate.columns)}
     for cut in cuts:
+        j = column[cut.unit]
         for i in cut.positions:
-            values[i, column[cut.unit]] = 0.0
+            # A cut drops exactly one member: a single unit goes 1 -> 0, a
+            # cluster's count falls by one over these hours. The floor is
+            # belt-and-braces; positions come from a layer that was on.
+            values[i, j] = max(0.0, values[i, j] - 1.0)
     candidate.loc[:, :] = values
     return candidate
 

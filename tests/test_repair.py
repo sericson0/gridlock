@@ -151,6 +151,94 @@ def test_a_cut_trims_the_shoulders_and_leaves_the_peak_alone():
     assert repaired.notes["repair_shed_after"] == pytest.approx(0.0, abs=1e-6)
 
 
+def cluster_system(num_units, load, max_mw=100, min_mw=20, no_load=400, hours=12):
+    """A cheap baseload unit plus one cluster of `num_units` dear peakers."""
+    system = make_system(
+        [
+            gen("base", "A", 10, 400, min_mw=0, no_load_cost=50),
+            gen("peak", "A", 30, max_mw, min_mw=min_mw, no_load_cost=no_load,
+                startup_cost=100),
+        ],
+        {"A": list(load)},
+    )
+    system.generators.loc["peak", "num_units"] = float(num_units)
+    return system
+
+
+def test_decommit_drops_one_cluster_member_not_the_whole_row():
+    """A cut on a count column is a member, not the fleet.
+
+    Before the layer decomposition this pass skipped clusters entirely, so
+    an over-committed cluster kept every member it was handed.
+    """
+    system = cluster_system(num_units=3, load=[80.0] * 12)  # > 3 x 20 MW min
+    hours = list(range(12))
+    guess = guess_from(system, hours, {"base": [1] * 12, "peak": [3] * 12})
+
+    repaired = repair_guess(system, uc_config(), hours, guess)
+    peak = repaired.commitment["peak"]
+    assert peak.max() <= 3.0, "a count may never exceed the fleet"
+    assert peak.min() >= 0.0
+    assert peak.sum() < 36.0, "nothing was decommitted at all"
+    assert repaired.notes["repair_decommitted_unit_hours"] > 0
+    assert repaired.notes["repair_objective_after"] < repaired.notes[
+        "repair_objective_before"
+    ]
+
+
+def test_cluster_decommit_keeps_the_members_the_load_needs():
+    """Load needing two of three members must keep two.
+
+    The saving is priced per member (p/u), so the ranking has to stop once
+    the remaining members are carrying load rather than dropping the row.
+    """
+    # 80 MW is base-only territory; 520 MW needs base plus two members.
+    system = cluster_system(num_units=3, load=[80.0] * 4 + [520.0] * 4 + [80.0] * 4)
+    hours = list(range(12))
+    guess = guess_from(system, hours, {"base": [1] * 12, "peak": [3] * 12})
+
+    repaired = repair_guess(system, uc_config(), hours, guess)
+    peak = repaired.commitment["peak"]
+    assert (peak.loc[4:7] >= 2.0).all(), "the peak hours need the capacity"
+    assert peak.sum() < 36.0, "the flat hours do not"
+    assert repaired.notes["repair_shed_after"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_cluster_decommit_leaves_the_aggregate_rows_satisfiable():
+    """Whatever it cuts, the result must still complete without relaxation."""
+    import numpy as np
+
+    system = cluster_system(
+        num_units=4, load=[100.0] * 6 + [300.0] * 6, no_load=300, hours=12
+    )
+    system.generators.loc["peak", "min_up_time_hr"] = 3.0
+    system.generators.loc["peak", "min_down_time_hr"] = 2.0
+    hours = list(range(12))
+    guess = guess_from(system, hours, {"base": [1] * 12, "peak": [4] * 12})
+
+    repaired = repair_guess(system, uc_config(), hours, guess)
+    counts = repaired.commitment["peak"].to_numpy(float)
+    n, up, dn = 4, 3, 2
+    prev = np.roll(counts, 1)
+    v, w = np.maximum(counts - prev, 0), np.maximum(prev - counts, 0)
+    for tt in range(12):
+        assert sum(v[(tt - k) % 12] for k in range(up)) <= counts[tt] + 1e-9
+        assert sum(w[(tt - k) % 12] for k in range(dn)) <= n - counts[tt] + 1e-9
+    # And the completion of what it returned is genuinely feasible.
+    assert repaired.notes["repair_shed_after"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_single_unit_decommit_is_unchanged_by_the_layer_path():
+    """N=1 must walk the identical code and give the identical answer."""
+    system = surplus_system()
+    hours = list(range(12))
+    guess = guess_from(system, hours, {"cheap": [1] * 12, "dear": [1] * 12})
+    repaired = repair_guess(system, uc_config(), hours, guess)
+    assert repaired.commitment["dear"].sum() == 0.0
+    assert repaired.commitment["cheap"].sum() == 12.0
+    assert repaired.notes["repair_decommitted_unit_hours"] == 12
+
+
 def test_decommit_will_not_buy_its_saving_with_unserved_energy():
     """Capacity that is load-carrying stays, however dear it looks."""
     system = make_system(
