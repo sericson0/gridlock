@@ -371,8 +371,32 @@ def repair_min_up_down(
     Because each pass can create new violations of the other kind, they are
     iterated to a fixed point (bounded; the schedule is monotone so it can
     only converge or saturate at always-on).
+
+    **Clusters** carry a committed *count* in 0..N, not a 0/1 flag, and the
+    run-based repair above cannot read one: ``_runs_of(series, 1, ...)``
+    matches runs equal to exactly 1, so a count of 3 is invisible to it, and
+    ``_fill_short_gaps`` would write a literal 1 over a count. A count
+    column is therefore split into N *layers* — layer k is on wherever the
+    count reaches k — each layer repaired as the 0/1 series it now is, and
+    the results summed back into a count.
+
+    That decomposition is sound because the model's cluster rows are exactly
+    the sum of N single-unit rows. With ``v_t = max(u_t - u_{t-1}, 0)`` over
+    the summed count and ``v_{k,t}`` over layer k, ``v_t <= sum_k v_{k,t}``,
+    so::
+
+        sum_{lookback} v  <=  sum_k sum_{lookback} v_k  <=  sum_k x_{k,t}  =  u_t
+
+    which is the min-up row, and the same argument on ``w`` against
+    ``N - u_t`` gives min-down. The middle inequality is each layer's own
+    repaired constraint. It is a sufficient condition rather than an exact
+    one — the summed schedule may commit a little more than the cluster row
+    strictly needs — which is the safe direction and the one the rest of
+    this function already errs in. A single unit is the N=1 case of the same
+    code, byte for byte.
     """
     gens = system.generators
+    units = {g: max(1, int(n)) for g, n in gens["num_units"].items()}
     repaired = commitment.copy()
 
     for g in repaired.columns:
@@ -380,15 +404,25 @@ def repair_min_up_down(
         down = int(gens.at[g, "min_down_time_hr"])
         if up <= 1 and down <= 1:
             continue
-        series = repaired[g].to_numpy(dtype=float).round().astype(int)
-        for _ in range(8):
-            filled = _fill_short_gaps(series, min_length=down, cyclic=cyclic)
-            extended = _extend_short_runs(filled, min_length=up, cyclic=cyclic)
-            if (extended == series).all():
-                break
-            series = extended
-        repaired[g] = series.astype(float)
+        counts = repaired[g].to_numpy(dtype=float).round().astype(int)
+        total = np.zeros(len(counts), dtype=int)
+        for layer in range(1, units.get(g, 1) + 1):
+            total += _repair_layer(
+                (counts >= layer).astype(int), up=up, down=down, cyclic=cyclic
+            )
+        repaired[g] = total.astype(float)
     return repaired
+
+
+def _repair_layer(series: np.ndarray, up: int, down: int, cyclic: bool) -> np.ndarray:
+    """Iterate the two monotone repairs on one 0/1 series to a fixed point."""
+    for _ in range(8):
+        filled = _fill_short_gaps(series, min_length=down, cyclic=cyclic)
+        extended = _extend_short_runs(filled, min_length=up, cyclic=cyclic)
+        if (extended == series).all():
+            return series
+        series = extended
+    return series
 
 
 def _runs_of(series: np.ndarray, value: int, cyclic: bool) -> list[tuple[int, int]]:

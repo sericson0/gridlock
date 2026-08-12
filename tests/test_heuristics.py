@@ -264,6 +264,85 @@ def test_similar_days_transfers_schedules_between_lookalike_days():
     assert guess.notes["representatives"] == 2
 
 
+# ------------------------------------------------------------ cluster repair
+
+
+def _cluster_system(num_units, up, down, hours=24):
+    """One cluster of identical units, plus enough load to be well posed."""
+    system = make_system(
+        [gen("c", "A", 10, 100, min_mw=20, min_up=up, min_down=down)],
+        {"A": [50.0] * hours},
+    )
+    system.generators.loc["c", "num_units"] = float(num_units)
+    return system
+
+
+def _violations(counts, num_units, up, down, cyclic=True):
+    """Where a count schedule breaks the model's own cluster rows.
+
+    Mirrors gridlock/model.py: min-up is ``sum(v over UT) <= u`` and
+    min-down is ``sum(w over DT) <= N - u``.
+    """
+    import numpy as np
+
+    u = np.asarray(counts, dtype=float)
+    n = len(u)
+    previous = np.roll(u, 1)
+    v = np.maximum(u - previous, 0.0)
+    w = np.maximum(previous - u, 0.0)
+    bad = []
+    for t in range(n):
+        if up > 1 and sum(v[(t - k) % n] for k in range(up)) > u[t] + 1e-9:
+            bad.append(("min_up", t))
+        if down > 1 and sum(w[(t - k) % n] for k in range(down)) > num_units - u[t] + 1e-9:
+            bad.append(("min_down", t))
+    return bad
+
+
+def test_cluster_repair_does_not_overwrite_a_count():
+    """A cluster running flat out must stay at N, not be flattened to 1."""
+    system = _cluster_system(num_units=3, up=4, down=4)
+    frame = pd.DataFrame({"c": [3.0] * 24}, index=range(24))
+    out = repair_min_up_down(frame, system, cyclic=True)
+    assert list(out["c"]) == [3.0] * 24
+
+
+def test_cluster_repair_satisfies_the_models_own_rows():
+    """The repaired count schedule must not violate min up/down anywhere.
+
+    This is the defect that made `heuristic='lp'` with `cluster_units=True`
+    infeasible: the repair left a count column breaking its own min-up row,
+    and pinning `u` to it gave the completion no feasible point at all.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    for num_units, up, down in ((2, 8, 4), (3, 3, 3), (5, 4, 2), (4, 2, 6)):
+        system = _cluster_system(num_units, up, down, hours=48)
+        for _ in range(15):
+            counts = rng.integers(0, num_units + 1, size=48).astype(float)
+            frame = pd.DataFrame({"c": counts}, index=range(48))
+            out = repair_min_up_down(frame, system, cyclic=True)
+            values = out["c"].to_numpy()
+            assert values.max() <= num_units, "a count may never exceed the fleet"
+            assert (values >= counts).all(), "the repair must stay monotone"
+            assert not _violations(values, num_units, up, down), (
+                f"N={num_units} up={up} down={down} left "
+                f"{_violations(values, num_units, up, down)[:3]}"
+            )
+
+
+def test_single_unit_repair_is_the_n_equals_one_case():
+    """The layer decomposition must not change any existing single-unit result."""
+    system = _cluster_system(num_units=1, up=4, down=3)
+    frame = pd.DataFrame(
+        {"c": [1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0] + [0.0] * 16}, index=range(24)
+    )
+    out = repair_min_up_down(frame, system, cyclic=True)
+    assert set(out["c"].unique()) <= {0.0, 1.0}
+    assert not _violations(out["c"].to_numpy(), 1, 4, 3)
+
+
 # ------------------------------------------------------- hot-start scoring
 
 

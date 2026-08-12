@@ -44,7 +44,12 @@ from pathlib import Path
 import pandas as pd
 
 from gridlock.config import RunConfig, SolverSettings
-from gridlock.data import SystemData, build_system, load_system
+from gridlock.data import (
+    SystemData,
+    build_system,
+    cluster_identical_units,
+    load_system,
+)
 from gridlock.heuristics import lp_relaxation_guess
 from gridlock.scoring import score_guess
 
@@ -99,6 +104,13 @@ def score_week(
 ) -> list[dict]:
     """Score every variant against one week, sharing a single LP bound."""
     sliced = slice_hours(system, start_hour, start_hour + args.hours)
+    if args.cluster:
+        # Pool interchangeable units into integer-count clusters. This is the
+        # model the guess is built against *and* scored on, so the margin
+        # stays internally consistent -- but a clustered bound is not the
+        # unclustered one (pooling is a slight relaxation), so margins do not
+        # compare across the flag.
+        sliced = cluster_identical_units(sliced)
     hours = list(range(args.hours))
 
     # The bound every margin is measured against. Built once here; the 'lp'
@@ -173,6 +185,11 @@ def main() -> int:
     parser.add_argument("--voll", type=float, default=10_000.0)
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--no-tight", dest="tight", action="store_false")
+    parser.add_argument(
+        "--cluster",
+        action="store_true",
+        help="pool identical generators into integer-count clusters first",
+    )
     parser.add_argument("--out", default=None, help="write rows to this CSV")
     parser.set_defaults(tight=True)
     args = parser.parse_args()

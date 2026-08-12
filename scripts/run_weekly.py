@@ -214,6 +214,7 @@ def solve_week(
         soft_fixing_budget=args.soft_budget,
         tight_generation_limits=args.tight,
         tight_ramp_limits=args.tight,
+        cluster_units=args.cluster,
         voll=args.voll,
         # Without this the HiGHS log is never parsed, so the
         # highs_run_seconds / translate_seconds split written below comes
@@ -431,6 +432,12 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--voll", type=float, default=10_000.0)
     parser.add_argument("--no-tight", dest="tight", action="store_false")
+    parser.add_argument(
+        "--cluster",
+        action="store_true",
+        help="pool identical generators into integer-count clusters, "
+        "removing the permutation symmetry between them",
+    )
     parser.add_argument(
         "--chain",
         action="store_true",
