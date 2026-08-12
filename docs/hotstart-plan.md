@@ -214,7 +214,61 @@ zero. Negligible against the margin ($800), but it means the polish can
 undo the repair's feasibility guarantee — the sub-MIP is free to decommit
 and answers to its own dispatch, not to the repair's invariant.
 
+## The confirming solve: these weeks are bound-limited
+
+Weeks 0/9/44 solved for real from repaired-and-polished starts, 0.5% gap,
+3,600 s limit (`results/weekly/rts_gmlc_confirm/`):
+
+| week | start | final objective | match | nodes | bound: LP → final | end gap | baseline (1,200 s) |
+|---|---|---|---|---|---|---|---|
+| 00 | 5,705,833 | **5,705,833** | 100% | 3,555 | +0.074% | 0.90% | 5,728,835, 1.32% |
+| 09 | 6,549,442 | **6,549,442** | 100% | 3,820 | +0.105% | 0.74% | 6,562,759, 0.96% |
+| 44 | 4,703,883 | **4,703,883** | 100% | 1,905 | +0.102% | 0.60% | 4,728,008, 1.15% |
+
+**Branch-and-bound improved the incumbent by nothing at all.** Not "a
+little" — the final objective equals the start to the dollar on all three
+weeks, across 1,905 to 3,820 nodes and an hour of HiGHS each. Every gain
+came from ~660 s of preprocessing.
+
+**The binding constraint is the bound, not the incumbent.** To terminate,
+week00 needed its bound up 0.404% and got 0.074%; week09 needed 0.242% and
+got 0.105%; week44 needed 0.097% and got 0.102% — it very nearly closed.
+The bound climbs at roughly 0.07–0.10% per hour on these instances, and
+nothing in this plan addresses that.
+
+This refines rather than contradicts the recorded finding that the gap here
+is primal-side. Both hold, at different points on the same curve: *without*
+a warm start the problem is primal — HiGHS's own heuristics fail and the
+incumbent is terrible — but once the start is good, the residual is dual,
+and further incumbent work buys literally zero. Every track in this plan
+except 3e is incumbent work.
+
+**The threshold theory survives intact.** Against week00's real root bound
+of 5,652,683 anything at or below 5,681,088 terminates at one node, and a
+schedule costing 5,676,660 is known to exist. The target has not moved; the
+start is 0.44% short of it, and the solver demonstrably cannot close that
+remainder itself — neither by finding a better incumbent (3,555 nodes, no
+improvement) nor by lifting the bound (0.074% in an hour).
+
+Two consequences:
+
+- **The ensemble-screen polish is now the whole game, not a refinement.**
+  The 47 LP-integral entries across 8 units that the entry screen pins
+  wrongly are exactly what stands between +0.478% and a one-node solve, and
+  the historical ensemble run — which pins only what its screen vouches for
+  and budgets the residue — is the run that actually found 5,676,660.
+- **3e stops being a footnote.** On a warm-started week the bound is the
+  whole gap. Formulation tightening and cuts are the only things that move
+  it; no guess ever will.
+
+Worth keeping even so: the polished runs return answers 0.20–0.51% cheaper
+than the censored baselines. If the goal is a good schedule rather than a
+proof of optimality, the preprocessing pays even when the solve times out.
+And a strong incumbent makes nodes cheap — 14x the nodes in 3x the time on
+week00 — it just does not make the bound move.
+
 ## Track 1 — structure
+
 
 
 **1a. A decommitment pass.** The +2.7% bias has no counter-pass. Rank each
