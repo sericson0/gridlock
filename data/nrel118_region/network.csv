@@ -1,0 +1,4 @@
+line,from_node,to_node,capacity_mw,loss_factor
+Region_R1__Region_R2,Region_R1,Region_R2,4700.0,0.0
+Region_R1__Region_R3,Region_R1,Region_R3,4100.0,0.0
+Region_R2__Region_R3,Region_R2,Region_R3,10000.0,0.0

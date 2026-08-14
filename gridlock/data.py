@@ -41,6 +41,11 @@ GENERATOR_OPTIONAL_COLUMNS = {
     "shutdown_cost": 0.0,
     "min_up_time_hr": 1,
     "min_down_time_hr": 1,
+    # A row with num_units > 1 is a *cluster* of that many identical units:
+    # every capacity/cost column stays per unit, and commitment becomes an
+    # integer count in [0, num_units] instead of a binary. See
+    # cluster_identical_units().
+    "num_units": 1,
 }
 
 STORAGE_REQUIRED_COLUMNS = [
@@ -199,6 +204,11 @@ def _prepare_generators(generators: pd.DataFrame, nodes: pd.DataFrame) -> pd.Dat
     ].tolist()
     if bad_time:
         raise ValueError(f"generators with min up/down time below 1 hour: {bad_time}")
+    bad_count = gens.index[
+        (gens["num_units"] < 1) | (gens["num_units"] % 1 != 0)
+    ].tolist()
+    if bad_count:
+        raise ValueError(f"generators with num_units below 1 or non-integer: {bad_count}")
 
     # Derived economics: $/MWh at the margin, and $/hr while committed.
     gens["marginal_cost"] = (
@@ -219,6 +229,91 @@ def _prepare_generators(generators: pd.DataFrame, nodes: pd.DataFrame) -> pd.Dat
         | (gens["min_down_time_hr"] > 1)
     )
     return gens
+
+
+# Columns that must match exactly for two generator rows to be poolable
+# into one cluster. Anything not listed here is either derived from these
+# (marginal_cost, no_load_cost, needs_commitment) or is the unit's identity.
+_CLUSTER_KEY_COLUMNS = [
+    "node",
+    "technology",
+    "max_mw",
+    "min_mw",
+    "heat_rate_slope_mmbtu_per_mwh",
+    "heat_rate_intercept_mmbtu_per_hr",
+    "fuel_cost_per_mmbtu",
+    "vom_cost_per_mwh",
+    "startup_cost",
+    "shutdown_cost",
+    "ramp_rate_mw_per_hr",
+    "min_up_time_hr",
+    "min_down_time_hr",
+]
+
+
+def cluster_identical_units(system: SystemData, name_suffix: str = "_cluster") -> SystemData:
+    """Pool identical generators into integer-commitment clusters.
+
+    Units that agree on every parameter in ``_CLUSTER_KEY_COLUMNS``, sit at
+    the same node and share an availability profile (or all lack one)
+    collapse into a single row carrying ``num_units``. The model then
+    commits an integer *count* rather than one binary per unit, which both
+    shrinks the model and removes the permutation symmetry that makes
+    branch-and-bound explore equivalent schedules (Palmintier & Webster,
+    IEEE TPWRS 29(3), 2014).
+
+    The pooled model is a *relaxation* of the per-unit one: a cluster can
+    move ramp capability between its members, so a clustered solve may
+    report slightly lower cost than the unit-level model it came from.
+    Existing ``num_units`` counts are summed, so clustering is idempotent.
+    """
+    gens = system.generators
+    availability = system.availability
+
+    profile_key = {}
+    for g in gens.index:
+        if g in availability.columns:
+            # Hash the profile so identical shapes group without comparing
+            # every pair of columns.
+            profile_key[g] = hash(tuple(availability[g].to_numpy().tolist()))
+        else:
+            profile_key[g] = None
+
+    keys = gens[_CLUSTER_KEY_COLUMNS].copy()
+    keys["_profile"] = pd.Series(profile_key)
+    grouped = keys.groupby(list(keys.columns), sort=False, dropna=False)
+
+    rows = []
+    new_availability = {}
+    for _, members in grouped:
+        names = list(members.index)
+        first = gens.loc[names[0]]
+        count = int(gens.loc[names, "num_units"].sum())
+        # Name the cluster after its first member: unique by construction
+        # (generator names already are) and traceable back to the input.
+        name = names[0] if len(names) == 1 else f"{names[0]}{name_suffix}"
+        row = first.to_dict()
+        row["name"] = name
+        row["num_units"] = count
+        rows.append(row)
+        if names[0] in availability.columns:
+            new_availability[name] = availability[names[0]].to_numpy()
+
+    clustered = pd.DataFrame(rows)
+
+    availability_frame = (
+        pd.DataFrame(new_availability)
+        if new_availability
+        else pd.DataFrame(index=pd.RangeIndex(system.num_hours))
+    )
+    return build_system(
+        generators=clustered,
+        storage=system.storage.reset_index(),
+        nodes=system.nodes.reset_index(),
+        network=system.network.reset_index(),
+        demand=system.demand,
+        availability=availability_frame,
+    )
 
 
 def _prepare_storage(storage: pd.DataFrame, nodes: pd.DataFrame) -> pd.DataFrame:

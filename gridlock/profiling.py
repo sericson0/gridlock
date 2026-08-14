@@ -88,6 +88,43 @@ class SolveMetrics:
     presolve_seconds: float | None = None
     solve_phase_seconds: float | None = None
     postsolve_seconds: float | None = None
+
+    # Root-loop attribution (MIP log only). The UC MIP solves at the root,
+    # so these split root time between the main model and the sub-MIP
+    # heuristics, and LP iterations between separation and heuristics —
+    # the difference between "the cut loop is slow" and "the heuristics
+    # are slow", which have entirely different fixes.
+    solve_main_mip_seconds: float | None = None
+    solve_submip_seconds: float | None = None
+    submip_calls: int | None = None
+    lp_iters_separation: int | None = None
+    lp_iters_heuristics: int | None = None
+    lp_iters_strong_branching: int | None = None
+    mip_restarts: int | None = None
+    first_feasible_seconds: float | None = None
+    first_feasible_objective: float | None = None
+    final_cuts_in_lp: int | None = None
+    # What HiGHS did with a supplied MIP start. Silence here is the trap
+    # this exists to catch: a start HiGHS rejects (because the completion
+    # had to relax rows to build it, say) leaves no trace in the objective
+    # or the node count, so the run measures a cold solve wearing a warm
+    # start's name. ``mip_start_objective`` is HiGHS's own reading of the
+    # start it accepted, which is the number to compare against the
+    # threshold in :func:`gridlock.heuristics.hot_start_margin`.
+    mip_start_status: str | None = None
+    mip_start_objective: float | None = None
+    # The bound at the end of the root loop, i.e. the LP relaxation plus
+    # whatever the cut loop added. This is the number a warm start is
+    # really racing: clearing ``root_bound / (1 - gap)`` ends the solve at
+    # one node. The LP relaxation alone gives a conservative stand-in that
+    # is available *before* the solve (which is why the runner scores
+    # against it); this one is exact but only knowable afterwards, so it
+    # is the honest yardstick when grading a guess retrospectively.
+    root_bound: float | None = None
+    # Progress-table rows as a JSON list of dicts (time, bound, sol, gap,
+    # cuts in LP, cumulative LP iterations, source tag) — the bound and
+    # incumbent trajectory of the root loop, for research analysis.
+    mip_timeline_json: str | None = None
     matrix_coef_min: float | None = None
     matrix_coef_max: float | None = None
     cost_coef_min: float | None = None
@@ -189,6 +226,154 @@ _RE_PHASE_TIME = {
     "postsolve_seconds": re.compile(r"([\d.]+)\s+\(Postsolve\)"),
 }
 _NUM = r"([\d.]+e[+-]\d+|[\d.]+)"
+
+# One row of the MIP progress table, e.g.
+#  " L       0       0         0   0.00%   5758161.689821  5760305.185049
+#    0.04%     6201    686      0      5479    14.6s"
+# Columns: Src, nodes processed, in queue, leaves, explored %, best bound,
+# best solution, gap, cut-pool size, cuts in LP, conflicts, LP iterations
+# (may carry a k/M suffix), time. Objective fields may be inf/-inf.
+_MIP_OBJ = r"(-?inf|[-+]?[\d.]+(?:e[+-]?\d+)?)"
+_RE_MIP_PROGRESS = re.compile(
+    r"^\s*(?P<src>[A-Za-z]?)\s+(?P<proc>\d+)\s+(?P<inqueue>\d+)\s+(?P<leaves>\d+)\s+"
+    r"(?P<expl>[\d.]+)%\s+" + _MIP_OBJ.replace("(", "(?P<bound>", 1) + r"\s+"
+    + _MIP_OBJ.replace("(", "(?P<sol>", 1) + r"\s+(?P<gap>\S+)\s+"
+    r"(?P<cuts>\d+)\s+(?P<inlp>\d+)\s+(?P<confl>\d+)\s+"
+    r"(?P<lpiters>[\d.]+[kM]?)\s+(?P<time>[\d.]+)s\s*$",
+    re.MULTILINE,
+)
+_RE_RESTART = re.compile(r"^\s*Restarting", re.MULTILINE | re.IGNORECASE)
+# The end-of-solve report splits the Solve phase into main-MIP and sub-MIP
+# time, and LP iterations by purpose.
+_RE_SOLVE_SPLIT = re.compile(
+    r"\(Solve\)\s*\n\s*MIP\s+time \[calls\] = ([\d.]+) \[(\d+)\]"
+    r"\s*\n\s*subMIP time \[calls\] = ([\d.]+) \[(\d+)\]"
+)
+_RE_LP_ITERS_KIND = {
+    "lp_iters_strong_branching": re.compile(r"(\d+)\s+\(strong br\.\)"),
+    "lp_iters_separation": re.compile(r"(\d+)\s+\(separation\)"),
+    "lp_iters_heuristics": re.compile(r"(\d+)\s+\(heuristics\)"),
+}
+# HiGHS's verdict on a supplied MIP start. It reports acceptance with the
+# start's objective; a rejection instead shows up as one of the complaint
+# lines, which carry no objective and are therefore recorded as status
+# alone. Anything the pattern doesn't recognise leaves the status None,
+# which means "not observed" -- never "rejected".
+_RE_MIP_START = re.compile(
+    r"MIP start solution is ([^,\n]+?),\s*objective value is\s+"
+    r"(-?[\d.]+(?:[eE][+-]?\d+)?)"
+)
+_RE_MIP_START_REJECTED = re.compile(
+    r"User-supplied (?:solution has .*violations"
+    r"|values of discrete variables cannot yield feasible solution)"
+)
+
+
+def _parse_count_suffix(raw: str) -> int:
+    """LP-iteration counts may be abbreviated ('129k'). Expand to an int."""
+    scale = 1
+    if raw.endswith("k"):
+        scale, raw = 1_000, raw[:-1]
+    elif raw.endswith("M"):
+        scale, raw = 1_000_000, raw[:-1]
+    return int(float(raw) * scale)
+
+
+def _parse_objective(raw: str) -> float | None:
+    if "inf" in raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def parse_mip_progress(text: str) -> dict:
+    """Extract the root-loop story from a HiGHS MIP log.
+
+    Returns a dict of :class:`SolveMetrics` field names. Every parse is
+    tolerant: a log without the expected blocks (LP solves, older HiGHS
+    versions) yields Nones.
+    """
+    out: dict = {
+        "solve_main_mip_seconds": None,
+        "solve_submip_seconds": None,
+        "submip_calls": None,
+        "lp_iters_separation": None,
+        "lp_iters_heuristics": None,
+        "lp_iters_strong_branching": None,
+        "mip_restarts": None,
+        "first_feasible_seconds": None,
+        "first_feasible_objective": None,
+        "final_cuts_in_lp": None,
+        "mip_timeline_json": None,
+        "mip_start_status": None,
+        "mip_start_objective": None,
+        "root_bound": None,
+    }
+
+    # HiGHS may complain about a start's violations and then repair it, so
+    # the explicit verdict wins wherever both appear; the complaint only
+    # stands in when no verdict was logged at all.
+    start = _RE_MIP_START.search(text)
+    if start:
+        out["mip_start_status"] = start.group(1).strip()
+        out["mip_start_objective"] = _parse_objective(start.group(2))
+    elif _RE_MIP_START_REJECTED.search(text):
+        out["mip_start_status"] = "rejected"
+
+    timeline = []
+    for match in _RE_MIP_PROGRESS.finditer(text):
+        row = {
+            "src": match.group("src") or None,
+            "time": float(match.group("time")),
+            "bound": _parse_objective(match.group("bound")),
+            "sol": _parse_objective(match.group("sol")),
+            "gap_pct": (
+                float(match.group("gap")[:-1])
+                if match.group("gap").endswith("%")
+                else None
+            ),
+            "cuts_in_lp": int(match.group("inlp")),
+            "lp_iters": _parse_count_suffix(match.group("lpiters")),
+            "nodes": int(match.group("proc")),
+        }
+        timeline.append(row)
+
+    if timeline:
+        out["mip_timeline_json"] = json.dumps(timeline)
+        out["final_cuts_in_lp"] = timeline[-1]["cuts_in_lp"]
+        for row in timeline:
+            if row["sol"] is not None:
+                out["first_feasible_seconds"] = row["time"]
+                out["first_feasible_objective"] = row["sol"]
+                break
+        # Root loop = every row logged before the first node was processed.
+        # Its last bound is what the cut loop achieved; on a one-node solve
+        # every row qualifies and this is simply the final bound.
+        root_rows = [
+            row for row in timeline if row["nodes"] == 0 and row["bound"] is not None
+        ]
+        if root_rows:
+            out["root_bound"] = root_rows[-1]["bound"]
+
+    restarts = len(_RE_RESTART.findall(text))
+    if timeline or restarts:
+        out["mip_restarts"] = restarts
+
+    split = _RE_SOLVE_SPLIT.search(text)
+    if split:
+        out["solve_main_mip_seconds"] = float(split.group(1))
+        out["solve_submip_seconds"] = float(split.group(3))
+        out["submip_calls"] = int(split.group(4))
+
+    for name, pattern in _RE_LP_ITERS_KIND.items():
+        match = pattern.search(text)
+        if match:
+            out[name] = int(match.group(1))
+    return out
+
+
 _RE_COEF_RANGE = {
     ("matrix_coef_min", "matrix_coef_max"): re.compile(
         r"Matrix\s+\[" + _NUM + r",\s*" + _NUM + r"\]"
@@ -245,6 +430,8 @@ def parse_highs_log(text: str) -> dict:
         match = pattern.search(text)
         out[low_name] = float(match.group(1)) if match else None
         out[high_name] = float(match.group(2)) if match else None
+
+    out.update(parse_mip_progress(text))
     return out
 
 

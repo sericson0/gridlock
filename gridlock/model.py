@@ -13,9 +13,16 @@ Formulation summary (full math in docs/formulation.md):
 - Generators that need on/off state (non-zero minimum, startup/shutdown
   cost, no-load cost, or min up/down times) get commitment variables
   ``u``/``v``/``w`` (on / started / stopped). With ``config.unit_commitment``
-  True these are binary; False relaxes them to [0, 1] leaving the model
-  structure otherwise identical. Units that don't need state (typically
-  renewables) dispatch freely in [0, availability * max].
+  True these are integral; False relaxes them leaving the model structure
+  otherwise identical. Units that don't need state (typically renewables)
+  dispatch freely in [0, availability * max]. A generator row with
+  ``num_units > 1`` is a *cluster* of identical units: ``u`` counts how
+  many are committed (0..N) instead of being binary, which removes the
+  permutation symmetry between interchangeable units.
+- ``config.tight_generation_limits`` and ``config.tight_ramp_limits`` swap
+  the output and ramp rows for their convex-hull-tighter equivalents (see
+  the respective builders). They change the LP relaxation, never the set
+  of integer-feasible schedules.
 - Availability factors derate both maximum and minimum stable output, so a
   partially derated unit may stay committed at reduced output. Units with
   no availability profile are fully available every hour.
@@ -90,10 +97,10 @@ def build_model(
     _add_network_variables(m, system)
     _add_unserved_energy_variables(m, system, hours)
 
-    _add_generator_limits(m, system, hours)
+    _add_generator_limits(m, system, config, hours, initial)
     _add_commitment_logic(m, system, hours, initial)
     _add_min_up_down_times(m, system, hours, initial)
-    _add_ramp_limits(m, system, hours, initial)
+    _add_ramp_limits(m, system, config, hours, initial)
     _add_storage_constraints(m, system, hours, initial)
     _add_load_balance(m, system, hours)
     _add_objective(m, system, config)
@@ -115,6 +122,11 @@ def _previous_hour(m: pyo.ConcreteModel, t: int) -> int:
     return m.T.prevw(t)
 
 
+def _next_hour(m: pyo.ConcreteModel, t: int) -> int:
+    """The hour after ``t``, wrapping the last hour back to the first."""
+    return m.T.nextw(t)
+
+
 def _availability_arrays(system: SystemData) -> dict[str, np.ndarray]:
     """Hourly availability per unit, indexable by (global) hour.
 
@@ -127,6 +139,11 @@ def _availability_arrays(system: SystemData) -> dict[str, np.ndarray]:
 def _demand_arrays(system: SystemData) -> dict[str, np.ndarray]:
     """Hourly demand per node, indexable by (global) hour."""
     return {n: system.demand[n].to_numpy() for n in system.demand.columns}
+
+
+def _unit_counts(system: SystemData) -> dict[str, int]:
+    """Units represented by each generator row (1 unless it is a cluster)."""
+    return {g: int(n) for g, n in system.generators["num_units"].items()}
 
 
 # --------------------------------------------------------------------------
@@ -153,20 +170,41 @@ def _add_generator_variables(
     m: pyo.ConcreteModel, system: SystemData, config: RunConfig, hours: list[int]
 ) -> None:
     max_mw = system.generators["max_mw"].to_dict()
+    units = _unit_counts(system)
     availability = _availability_arrays(system)
 
     def output_bounds(m, g, t):
         profile = availability.get(g)
         upper = max_mw[g] if profile is None else max_mw[g] * profile[t]
-        return (0.0, upper)
+        return (0.0, upper * units[g])
 
     m.p = pyo.Var(m.G, m.T, bounds=output_bounds, doc="generation (MW)")
 
-    # The unit-commitment switch: binary on/off versus its LP relaxation.
-    commitment_domain = pyo.Binary if config.unit_commitment else pyo.UnitInterval
-    m.u = pyo.Var(m.G_UC, m.T, domain=commitment_domain, doc="committed (on/off)")
-    m.v = pyo.Var(m.G_UC, m.T, domain=pyo.UnitInterval, doc="startup indicator")
-    m.w = pyo.Var(m.G_UC, m.T, domain=pyo.UnitInterval, doc="shutdown indicator")
+    # The unit-commitment switch: integral commitment versus its LP
+    # relaxation. A cluster of N identical units commits an integer count
+    # in [0, N]; the common N == 1 case stays a plain binary so the model
+    # HiGHS receives is byte-for-byte what it was before clustering existed.
+    def commitment_domain(m, g, t):
+        if not config.unit_commitment:
+            return pyo.NonNegativeReals
+        return pyo.Binary if units[g] == 1 else pyo.NonNegativeIntegers
+
+    def count_bounds(m, g, t):
+        return (0.0, float(units[g]))
+
+    m.u = pyo.Var(
+        m.G_UC,
+        m.T,
+        domain=commitment_domain,
+        bounds=count_bounds,
+        doc="units committed (on/off, or a count for clusters)",
+    )
+    m.v = pyo.Var(
+        m.G_UC, m.T, domain=pyo.NonNegativeReals, bounds=count_bounds, doc="startups"
+    )
+    m.w = pyo.Var(
+        m.G_UC, m.T, domain=pyo.NonNegativeReals, bounds=count_bounds, doc="shutdowns"
+    )
 
 
 def _add_storage_variables(m: pyo.ConcreteModel, system: SystemData) -> None:
@@ -210,19 +248,89 @@ def _add_unserved_energy_variables(
 # --------------------------------------------------------------------------
 
 
-def _add_generator_limits(m: pyo.ConcreteModel, system: SystemData, hours: list[int]) -> None:
-    """Committed units run between derated min and max; others are bound-only."""
+def _add_generator_limits(
+    m: pyo.ConcreteModel,
+    system: SystemData,
+    config: RunConfig,
+    hours: list[int],
+    initial: InitialState | None,
+) -> None:
+    """Committed units run between derated min and max; others are bound-only.
+
+    With ``config.tight_generation_limits`` the upper bound also charges
+    for startup and shutdown: a unit that starts in hour t cannot exceed
+    its startup capability there, and one that stops in t+1 cannot exceed
+    its shutdown capability in t. Same variables, tighter relaxation.
+    """
     gens = system.generators
     max_mw = gens["max_mw"].to_dict()
     min_mw = gens["min_mw"].to_dict()
+    ramp_rate = gens["ramp_rate_mw_per_hr"].to_dict()
+    up_time = {g: int(v) for g, v in gens["min_up_time_hr"].items()}
     availability = _availability_arrays(system)
+    last = hours[-1]
+    cyclic = initial is None
 
-    def max_output_rule(m, g, t):
+    def available_mw(g, t):
         profile = availability.get(g)
-        available = max_mw[g] if profile is None else max_mw[g] * profile[t]
-        return m.p[g, t] <= available * m.u[g, t]
+        return max_mw[g] if profile is None else max_mw[g] * profile[t]
 
-    m.max_output = pyo.Constraint(m.G_UC, m.T, rule=max_output_rule)
+    def ramp_capability(g, t):
+        """Output allowed in the hour a unit starts up or shuts down.
+
+        Mirrors the startup/shutdown ramp allowance used by the ramp rows:
+        a unit may come up to its minimum stable level even when that
+        exceeds its hourly ramp rate. Capped at what is available so a
+        derated hour can never permit more than the derated maximum.
+        """
+        return min(max(min_mw[g], ramp_rate[g]), available_mw(g, t))
+
+    if not config.tight_generation_limits:
+
+        def max_output_rule(m, g, t):
+            return m.p[g, t] <= available_mw(g, t) * m.u[g, t]
+
+        m.max_output = pyo.Constraint(m.G_UC, m.T, rule=max_output_rule)
+    else:
+        # A unit with a one-hour minimum up time can start in t and stop in
+        # t+1, so both allowances would apply at once and could bind below
+        # its minimum stable level. Those units get the two terms as
+        # separate rows; everything else gets the single tighter row.
+        m.G_UT1 = pyo.Set(
+            initialize=[g for g in m.G_UC if up_time[g] <= 1], within=m.G_UC, ordered=True
+        )
+        m.G_UT2 = pyo.Set(
+            initialize=[g for g in m.G_UC if up_time[g] > 1], within=m.G_UC, ordered=True
+        )
+
+        def shutdown_term(m, g, t):
+            """(available - SD) * w_{t+1}, or zero where t+1 leaves the window."""
+            if t == last and not cyclic:
+                return 0.0
+            nxt = _next_hour(m, t)
+            return (available_mw(g, t) - ramp_capability(g, t)) * m.w[g, nxt]
+
+        def max_output_rule(m, g, t):
+            available = available_mw(g, t)
+            startup = (available - ramp_capability(g, t)) * m.v[g, t]
+            return m.p[g, t] <= available * m.u[g, t] - startup - shutdown_term(m, g, t)
+
+        m.max_output = pyo.Constraint(m.G_UT2, m.T, rule=max_output_rule)
+
+        def max_output_startup_rule(m, g, t):
+            available = available_mw(g, t)
+            return (
+                m.p[g, t]
+                <= available * m.u[g, t]
+                - (available - ramp_capability(g, t)) * m.v[g, t]
+            )
+
+        m.max_output_startup = pyo.Constraint(m.G_UT1, m.T, rule=max_output_startup_rule)
+
+        def max_output_shutdown_rule(m, g, t):
+            return m.p[g, t] <= available_mw(g, t) * m.u[g, t] - shutdown_term(m, g, t)
+
+        m.max_output_shutdown = pyo.Constraint(m.G_UT1, m.T, rule=max_output_shutdown_rule)
 
     def min_output_rule(m, g, t):
         if min_mw[g] <= 0:
@@ -293,19 +401,25 @@ def _add_min_up_down_times(
 
     m.min_up_time = pyo.Constraint(m.G_MIN_UP, m.T, rule=min_up_rule)
 
+    units = _unit_counts(system)
+
     def min_down_rule(m, g, t):
+        # Units shut down in the last DT hours must still be off, so at
+        # most (fleet size - committed) of them can be mid-downtime.
         return (
             pyo.quicksum(m.w[g, tau] for tau in lookback(t, down_time[g]))
-            <= 1 - m.u[g, t]
+            <= units[g] - m.u[g, t]
         )
 
     m.min_down_time = pyo.Constraint(m.G_MIN_DOWN, m.T, rule=min_down_rule)
 
     # Carry unfinished min up/down obligations across a window boundary by
-    # fixing the first hours of this window to the inherited state.
+    # fixing the first hours of this window to the inherited state. Only
+    # meaningful for single units: a cluster's members are mid-obligation
+    # individually, which one aggregate count cannot express.
     if initial is not None and initial.state_hours:
         for g, run_hours in initial.state_hours.items():
-            if g not in m.G_UC:
+            if g not in m.G_UC or units[g] > 1:
                 continue
             if run_hours > 0 and run_hours < up_time[g]:
                 hours_to_fix = min(up_time[g] - run_hours, window_len)
@@ -320,10 +434,24 @@ def _add_min_up_down_times(
 def _add_ramp_limits(
     m: pyo.ConcreteModel,
     system: SystemData,
+    config: RunConfig,
     hours: list[int],
     initial: InitialState | None,
 ) -> None:
-    """Hour-to-hour ramp limits, with startup/shutdown ramps of max(min_mw, ramp)."""
+    """Hour-to-hour ramp limits, with startup/shutdown ramps of max(min_mw, ramp).
+
+    The default rows bound the step by ``ramp * u`` on the committed side
+    plus a startup (or shutdown) allowance. With
+    ``config.tight_ramp_limits`` they become the two-period convex-hull
+    inequalities of Damcı-Kurt et al., which additionally subtract the
+    minimum stable level on the other side of the step:
+
+        p_t - p_{t-1} <= (Pmin + RU) u_t - Pmin u_{t-1} - (Pmin + RU - SU) v_t
+
+    Both forms give SU in the startup hour and RU while running, but the
+    tight one also states that a unit shutting down must fall by at least
+    its minimum stable level — which the loose form leaves to a big-M.
+    """
     gens = system.generators
     first = hours[0]
     cyclic = initial is None
@@ -333,8 +461,22 @@ def _add_ramp_limits(
     max_mw = gens["max_mw"].to_dict()
     min_mw = gens["min_mw"].to_dict()
     ramp_rate = gens["ramp_rate_mw_per_hr"].to_dict()
+    availability = _availability_arrays(system)
     committed = set(gens.index[gens["needs_commitment"]])
     start_ramp = {g: max(min_mw[g], ramp_rate[g]) for g in committed}
+
+    def floor_mw(g, t):
+        profile = availability.get(g)
+        return min_mw[g] if profile is None else min_mw[g] * profile[t]
+
+    def step_floor(g, t, prev):
+        """Minimum stable level valid on both sides of a t-1 -> t step.
+
+        Taking the smaller of the two derated floors keeps the inequality
+        valid when an availability profile lowers the floor across the
+        step; without a profile both are the same number.
+        """
+        return min(floor_mw(g, prev), floor_mw(g, t))
 
     # A unit that can traverse its whole range in one hour needs no ramp rows.
     m.G_RAMP = pyo.Set(
@@ -342,6 +484,8 @@ def _add_ramp_limits(
         within=m.G,
         ordered=True,
     )
+
+    tight = config.tight_ramp_limits
 
     def ramp_up_rule(m, g, t):
         ramp = ramp_rate[g]
@@ -352,10 +496,23 @@ def _add_ramp_limits(
                 return m.p[g, t] - p0[g] <= ramp
             if u0 is None or g not in u0:
                 return pyo.Constraint.Skip
+            if tight:
+                floor = step_floor(g, t, t)
+                return m.p[g, t] - p0[g] <= (floor + ramp) * m.u[g, t] - floor * u0[
+                    g
+                ] - (floor + ramp - start_ramp[g]) * m.v[g, t]
             return m.p[g, t] - p0[g] <= ramp * u0[g] + start_ramp[g] * m.v[g, t]
         prev = _previous_hour(m, t)
         if g not in committed:
             return m.p[g, t] - m.p[g, prev] <= ramp
+        if tight:
+            floor = step_floor(g, t, prev)
+            return (
+                m.p[g, t] - m.p[g, prev]
+                <= (floor + ramp) * m.u[g, t]
+                - floor * m.u[g, prev]
+                - (floor + ramp - start_ramp[g]) * m.v[g, t]
+            )
         return (
             m.p[g, t] - m.p[g, prev]
             <= ramp * m.u[g, prev] + start_ramp[g] * m.v[g, t]
@@ -370,10 +527,23 @@ def _add_ramp_limits(
                 return pyo.Constraint.Skip
             if g not in committed:
                 return p0[g] - m.p[g, t] <= ramp
+            if tight and u0 is not None and g in u0:
+                floor = step_floor(g, t, t)
+                return p0[g] - m.p[g, t] <= (floor + ramp) * u0[g] - floor * m.u[
+                    g, t
+                ] - (floor + ramp - start_ramp[g]) * m.w[g, t]
             return p0[g] - m.p[g, t] <= ramp * m.u[g, t] + start_ramp[g] * m.w[g, t]
         prev = _previous_hour(m, t)
         if g not in committed:
             return m.p[g, prev] - m.p[g, t] <= ramp
+        if tight:
+            floor = step_floor(g, t, prev)
+            return (
+                m.p[g, prev] - m.p[g, t]
+                <= (floor + ramp) * m.u[g, prev]
+                - floor * m.u[g, t]
+                - (floor + ramp - start_ramp[g]) * m.w[g, t]
+            )
         return (
             m.p[g, prev] - m.p[g, t]
             <= ramp * m.u[g, t] + start_ramp[g] * m.w[g, t]

@@ -174,7 +174,64 @@ def scale_suite() -> list[BenchCase]:
     return cases
 
 
-SUITES = {"default": default_suite, "scale": scale_suite}
+def formulation_suite() -> list[BenchCase]:
+    """Formulation variants on one fixed horizon: what does tightness buy?
+
+    Every case solves the same 168 h UC problem at the same gap, changing
+    only the *model*: the startup/shutdown-aware generation limits, the
+    two-period ramp inequalities, and integer clustering of identical
+    units. The tightenings are valid reformulations, so costs must agree
+    within the gap — ``gridlock compare``'s cost check is the correctness
+    gate on the whole experiment.
+
+    Clustering only bites when a system actually contains interchangeable
+    units; on the example dataset every generator is distinct, so pair
+    this suite with a system from ``scripts/make_large_data.py``.
+    """
+    variants = [
+        ("base", "as-written formulation", {}),
+        (
+            "tight_gen",
+            "startup/shutdown-aware generation limits",
+            {"tight_generation_limits": True},
+        ),
+        ("tight_ramp", "two-period ramp inequalities", {"tight_ramp_limits": True}),
+        (
+            "tight",
+            "both tightenings",
+            {"tight_generation_limits": True, "tight_ramp_limits": True},
+        ),
+        ("cluster", "integer clustering of identical units", {"cluster_units": True}),
+        (
+            "cluster_tight",
+            "clustering plus both tightenings",
+            {
+                "cluster_units": True,
+                "tight_generation_limits": True,
+                "tight_ramp_limits": True,
+            },
+        ),
+    ]
+    return [
+        BenchCase(
+            f"uc_week_{name}",
+            f"168 h monolithic UC at 0.5% gap — {description}",
+            RunConfig(
+                unit_commitment=True,
+                num_hours=168,
+                solver=SolverSettings(mip_gap=0.005, time_limit=_MIP_TIME_LIMIT),
+                **flags,
+            ),
+        )
+        for name, description, flags in variants
+    ]
+
+
+SUITES = {
+    "default": default_suite,
+    "scale": scale_suite,
+    "formulation": formulation_suite,
+}
 
 
 def get_suite(name: str) -> list[BenchCase]:
