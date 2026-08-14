@@ -1222,7 +1222,10 @@ def apply_fixing(model: pyo.ConcreteModel, guess: CommitmentGuess, mode: str) ->
 
 
 def apply_soft_budget(
-    model: pyo.ConcreteModel, guess: CommitmentGuess, budget: int | None
+    model: pyo.ConcreteModel,
+    guess: CommitmentGuess,
+    budget: int | None,
+    name: str = "soft_fixing_budget",
 ) -> int:
     """Constrain the soft entries to deviate from the guess at most ``budget`` times.
 
@@ -1234,6 +1237,10 @@ def apply_soft_budget(
     which is exact for binary ``u`` because each term *is* ``|u - guess|``.
     ``budget = 0`` reduces to hard fixing; larger values buy back freedom one
     entry at a time. Returns how many variables the row covers.
+
+    ``name`` is the component name the row is added under. The runner uses
+    the default for the main solve; the sub-MIP polish adds a *temporary*
+    row under its own name so the two can coexist on one model.
 
     This is a restriction, not a relaxation: a budget below the optimum's
     true distance from the guess excludes it. On the 12-week RTS-GMLC study
@@ -1250,8 +1257,8 @@ def apply_soft_budget(
         terms.append(var if guess.commitment.at[t, g] < 0.5 else 1.0 - var)
     if not terms:
         return 0
-    model.soft_fixing_budget = pyo.Constraint(
-        expr=pyo.quicksum(terms) <= float(budget)
+    model.add_component(
+        name, pyo.Constraint(expr=pyo.quicksum(terms) <= float(budget))
     )
     return len(terms)
 

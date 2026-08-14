@@ -1,5 +1,6 @@
 """Sub-MIP polish: it improves the start, and it gives every fixing back."""
 
+import pandas as pd
 import pytest
 
 from gridlock import RunConfig, run
@@ -276,6 +277,164 @@ def test_unknown_screen_is_refused():
     guess = build_guess(system, uc_config(heuristic="lp"), list(range(24)))
     with pytest.raises(ValueError):
         screen_mask(guess, "column")
+
+
+# -------------------------------------------------------------- the gate
+
+
+def gate_fixture():
+    """A completed, over-committed guess — a polish with something to gain."""
+    system = merit_system(hours=48)
+    hours = list(range(48))
+    config = uc_config(heuristic="lp")
+    guess = over_committed_guess(system, hours, config)
+    model, session, guess, completion = completed(system, hours, config, guess)
+    return model, session, guess, config, completion
+
+
+def test_gate_discards_a_polish_that_misses_the_threshold():
+    """A start that improves without clearing is the measured worst case.
+
+    Week09 clustered: the polished start cost 294 s of preprocessing and
+    turned a 1,141 s proven-optimal solve into a timeout, because a deeper
+    local optimum leaves the neighbourhood heuristics nothing to search. So
+    a polish that will not clear must not be delivered.
+    """
+    model, session, guess, config, completion = gate_fixture()
+
+    # A bound far below the truth puts the threshold out of reach, so
+    # whatever the sub-MIP returns cannot clear it.
+    result = polish_guess(
+        model, guess, config, session=session, gate=True, lp_bound=1.0, mip_gap=0.005
+    )
+
+    assert not result.succeeded
+    assert result.guess.notes["polish_gate"] == "discarded"
+    assert result.guess.notes["polish_gate_margin"] > 0
+    # What is handed back is the *unpolished* schedule...
+    assert result.guess.commitment.equals(guess.commitment)
+    # ...and the model holds the solution that goes with it, because that is
+    # what the caller passes on as the warm start.
+    assert model.total_cost() == pytest.approx(completion.objective, rel=1e-9)
+    assert not any(var.fixed for var in model.u.values())
+
+
+def test_gate_keeps_a_polish_that_clears():
+    model, session, guess, config, completion = gate_fixture()
+
+    # A bound at the completion's own cost puts the threshold above it, so
+    # anything the polish returns clears.
+    result = polish_guess(
+        model,
+        guess,
+        config,
+        session=session,
+        gate=True,
+        lp_bound=completion.objective,
+        mip_gap=0.005,
+    )
+
+    assert result.succeeded
+    assert result.guess.notes["polish_gate"] == "cleared"
+    assert result.guess.commitment["peak"].sum() < 48  # the polish was kept
+    assert not any(var.fixed for var in model.u.values())
+
+
+def test_gate_without_a_bound_keeps_the_polish_and_says_so():
+    """No bound means no margin to gate on; keep it, but leave a trace."""
+    model, session, guess, config, _ = gate_fixture()
+
+    result = polish_guess(
+        model, guess, config, session=session, gate=True, lp_bound=None
+    )
+
+    assert result.succeeded
+    assert result.guess.notes["polish_gate"] == "no-bound"
+
+
+def test_gate_is_off_by_default():
+    model, session, guess, config, _ = gate_fixture()
+
+    result = polish_guess(model, guess, config, session=session, lp_bound=1.0)
+
+    assert result.succeeded
+    assert "polish_gate" not in result.guess.notes
+
+
+# ------------------------------------------------------- the soft budget
+
+
+def soft_guess(system, hours, config):
+    """The over-committed guess with the contested unit marked *soft*.
+
+    That is the ensemble's shape: an entry it is confident about but whose
+    mistakes concentrate, delivered as an allowance rather than a pin.
+    """
+    guess = over_committed_guess(system, hours, config)
+    guess.soft = pd.DataFrame(False, index=hours, columns=guess.commitment.columns)
+    guess.soft["peak"] = True
+    return guess
+
+
+def test_soft_budget_zero_holds_the_soft_entries_collectively():
+    system = merit_system(hours=48)
+    hours = list(range(48))
+    config = uc_config(heuristic="lp")
+    guess = soft_guess(system, hours, config)
+    model, session, guess, _ = completed(system, hours, config, guess)
+
+    result = polish_guess(model, guess, config, session=session, soft_budget=0)
+
+    assert result.succeeded
+    # Zero deviations allowed reduces to a fixing — and without the row the
+    # sub-MIP decommits this unit (test_polish_decommits_what_the_guess_...).
+    assert (result.guess.commitment["peak"] == 1.0).all()
+    assert result.notes["polish_soft_vars"] == 48
+    assert result.notes["polish_soft_budget"] == 0
+
+
+def test_soft_budget_row_never_survives_the_call():
+    """Like every pin here, the row shapes the sub-MIP and nothing else."""
+    system = merit_system(hours=48)
+    hours = list(range(48))
+    config = uc_config(heuristic="lp")
+    guess = soft_guess(system, hours, config)
+    model, session, guess, _ = completed(system, hours, config, guess)
+
+    polish_guess(model, guess, config, session=session, soft_budget=5)
+    assert model.find_component("polish_soft_budget") is None
+
+    # And it is removed even when the sub-MIP fails outright.
+    class Failing:
+        def solve(self, *args, **kwargs):
+            raise RuntimeError("solver found no feasible solution")
+
+    polish_guess(model, guess, config, session=Failing(), soft_budget=5)
+    assert model.find_component("polish_soft_budget") is None
+    assert not any(var.fixed for var in model.u.values())
+
+
+def test_a_budget_allows_more_freedom_than_pinning():
+    system = merit_system(hours=48)
+    hours = list(range(48))
+    config = uc_config(heuristic="lp")
+    guess = soft_guess(system, hours, config)
+    model, session, guess, completion = completed(system, hours, config, guess)
+
+    generous = polish_guess(
+        model,
+        guess,
+        config,
+        session=session,
+        soft_budget=48,
+        baseline_objective=completion.objective,
+    )
+
+    assert generous.succeeded
+    # With the whole soft column spendable the sub-MIP recovers what a zero
+    # budget forbids.
+    assert generous.guess.commitment["peak"].sum() < 48
+    assert generous.info.objective < completion.objective
 
 
 # ------------------------------------------------------------------- scoring

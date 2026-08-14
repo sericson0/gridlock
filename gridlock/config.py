@@ -176,11 +176,19 @@ class RunConfig:
 
     ``{}`` enables it with :mod:`gridlock.polish`'s defaults; the keys are
     that module's ``polish_guess`` keywords (``screen``, ``seconds``,
-    ``gap``). The polish pins what the guess is confident about, solves the
-    contested core as a small MIP, **releases every fixing**, and hands the
-    result to the real model as the warm start — so it changes what the
-    solver starts from and never what it is allowed to conclude. Requires
-    ``heuristic``: there is nothing to polish without a guess.
+    ``gap``, ``soft_budget``, ``gate``). The polish pins what the guess is
+    confident about, solves the contested core as a small MIP, **releases
+    every fixing**, and hands the result to the real model as the warm
+    start — so it changes what the solver starts from and never what it is
+    allowed to conclude. Requires ``heuristic``: there is nothing to polish
+    without a guess.
+
+    Two keys worth knowing: ``soft_budget`` constrains the guess's *soft*
+    entries inside the sub-MIP with a deviation-budget row instead of
+    leaving them free (the ensemble-screen polish), and ``gate`` delivers
+    the polished start only when its margin clears the root threshold —
+    a start that improves without clearing has been measured to make the
+    solve *slower* than the unpolished one.
     """
 
     def validate(self) -> None:

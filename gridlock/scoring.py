@@ -166,6 +166,12 @@ def score_guess(
             session=session,
             warmstart=not used_fallback,
             baseline_objective=info.objective,
+            # The margin gate needs the same bound the score itself is
+            # measured against, including a caller-supplied override.
+            lp_bound=(
+                lp_bound if lp_bound is not None else guess.notes.get("lp_objective")
+            ),
+            mip_gap=config.solver.mip_gap,
             **config.polish_options,
         )
         # Taken either way: a failed polish returns the guess untouched apart

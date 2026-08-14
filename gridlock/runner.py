@@ -233,6 +233,11 @@ def run(
                         session=session,
                         warmstart=not heuristic_fallback,
                         baseline_objective=completion_objective,
+                        # The margin gate (polish_options={"gate": ...})
+                        # needs the bound and gap the main solve will be
+                        # judged against; without a bound it never engages.
+                        lp_bound=guess.notes.get("lp_objective"),
+                        mip_gap=config.solver.mip_gap,
                         **config.polish_options,
                     )
                     if polished.succeeded:

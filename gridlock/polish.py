@@ -49,7 +49,12 @@ import pandas as pd
 import pyomo.environ as pyo
 
 from .config import RunConfig, SolverSettings
-from .heuristics import CommitmentGuess, complete_solution
+from .heuristics import (
+    CommitmentGuess,
+    apply_soft_budget,
+    complete_solution,
+    hot_start_margin,
+)
 from .solver import HighsSession, SolveInfo
 
 SCREENS = ("entry", "unit")
@@ -71,6 +76,15 @@ SCREENS = ("entry", "unit")
 # long before it (48 h took 38 s) and never notices the limit.
 _DEFAULT_GAP = 5e-4
 _DEFAULT_SECONDS = 600.0
+
+# Default slack for the margin gate (``gate=True``). The threshold the gate
+# tests against uses the LP bound, which is conservative: HiGHS's real root
+# bound is the LP plus its cut loop, measured at 0.012-0.056% on RTS-GMLC
+# weeks. A polished start within that much of the LP threshold clears the
+# *real* one (week44: +0.047% vs the LP bound, -0.015% vs the true root
+# bound, one node). 0.05% covers the measured range without admitting
+# starts that genuinely miss.
+_DEFAULT_GATE_SLACK = 5e-4
 
 
 @dataclass
@@ -151,6 +165,10 @@ def polish_guess(
     highs_options: dict | None = None,
     warmstart: bool = True,
     baseline_objective: float | None = None,
+    soft_budget: int | None = None,
+    gate: bool | float | None = None,
+    lp_bound: float | None = None,
+    mip_gap: float | None = None,
 ) -> PolishResult:
     """Solve the restricted MIP, release every fixing, return the schedule.
 
@@ -165,6 +183,32 @@ def polish_guess(
     minimum-output rows — the values on the model then violate the model the
     sub-MIP is solving, and offering them would only make HiGHS reject a
     start it had to read first.
+
+    ``soft_budget`` delivers the guess's *soft* entries to the sub-MIP as a
+    deviation allowance instead of leaving them entirely free: one temporary
+    local-branching row (see :func:`~gridlock.heuristics.apply_soft_budget`)
+    permitting at most this many disagreements with the guess across the
+    soft set. The screen already refuses to pin soft entries, so without a
+    budget an ensemble guess frees its whole fast fleet and the sub-MIP may
+    not converge inside the time limit; the budget keeps the freedom where
+    the mistakes are known to concentrate while keeping the search small.
+    The row is removed before returning — like every pin here, it shapes
+    the incumbent search and never the real solve.
+
+    ``gate`` decides whether the polished schedule is *delivered*. The
+    payoff of a warm start is bimodal: clearing the root threshold ends the
+    solve at one node, but a start that improves *without* clearing has been
+    measured to paralyse the search HiGHS would otherwise run (RTS-GMLC
+    week09 clustered: the repair-only start solved in 1,141 s, the polished
+    one — better by 0.7% — timed out beyond 2,400 s with zero incumbent
+    progress, because RINS/RENS neighbourhoods collapse around a deep local
+    optimum). With ``gate`` set, the polish is kept only when its margin
+    against ``lp_bound / (1 - mip_gap)`` is at or below the slack
+    (``True`` uses the measured cut-lift default, a float is the slack
+    itself); otherwise the completion is restored and the *unpolished*
+    guess is returned, with the attempt recorded in the notes. Requires
+    ``lp_bound``; without one the polish is kept and the gate noted as
+    unusable.
 
     Returns the polished guess, or the original one if the restricted MIP
     could not be solved or came back dearer. In every case the call leaves
@@ -200,6 +244,15 @@ def polish_guess(
         ours.append((g, t))
     free = sum(1 for var in model.u.values() if not var.fixed)
 
+    # The budget row is scoped to the sub-MIP exactly like the pins are:
+    # added under its own name (the runner's main-solve row may join the
+    # model later), removed in the same ``finally``.
+    soft_terms = 0
+    if soft_budget is not None:
+        soft_terms = apply_soft_budget(
+            model, guess, soft_budget, name="polish_soft_budget"
+        )
+
     session = session or HighsSession(model)
     info = None
     failure = None
@@ -214,6 +267,8 @@ def polish_guess(
     finally:
         for key in ours:
             model.u[key].unfix()
+        if soft_terms:
+            model.del_component("polish_soft_budget")
 
     elapsed = time.perf_counter() - start
     notes = {
@@ -225,6 +280,9 @@ def polish_guess(
         "polish_gap": gap,
         "polish_time_limit": seconds,
     }
+    if soft_budget is not None:
+        notes["polish_soft_budget"] = soft_budget
+        notes["polish_soft_vars"] = soft_terms
     if info is None:
         notes["polish_failed"] = failure
         # The guess itself is returned untouched; only its notes gain the
@@ -273,6 +331,35 @@ def polish_guess(
         notes["polish_improvement"] = (
             baseline_objective - info.objective
         ) / baseline_objective
+
+    if gate is not None and gate is not False:
+        slack = _DEFAULT_GATE_SLACK if gate is True else float(gate)
+        margin = hot_start_margin(info.objective, lp_bound, mip_gap)
+        notes["polish_gate_slack"] = slack
+        notes["polish_gate_margin"] = margin
+        if margin is None:
+            # Nothing to gate against: keep the polish, but say so — a sweep
+            # that thinks it measured the gate must be able to see it never
+            # engaged.
+            notes["polish_gate"] = "no-bound"
+        elif margin <= slack:
+            notes["polish_gate"] = "cleared"
+        else:
+            # The polished start improves without clearing, which is the
+            # measured worst case: it removes the room the search heuristics
+            # need without ending the search. Restore the completion so the
+            # model holds the solution that goes with the guess returned,
+            # and hand back the unpolished start.
+            notes["polish_gate"] = "discarded"
+            complete_solution(model, guess, session=session)
+            notes["polish_seconds"] = time.perf_counter() - start
+            return PolishResult(
+                replace(guess, notes={**guess.notes, **notes}),
+                None,
+                False,
+                notes["polish_seconds"],
+                notes,
+            )
 
     result = CommitmentGuess(
         name=f"{guess.name}+polish",
