@@ -340,6 +340,50 @@ run's shoulder, priced at `no_load - (price - mc)*(p/u)` per member. Also
 unbuilt: nothing converts a clustered result frame back to unit-level
 schedules, which the FIFO routine would supply.
 
+## The sequencing experiments (measured 2026-08-14)
+
+Four parallel probes, one day. Two positives, two negatives, and the
+negatives are the informative ones.
+
+**The margin gate is built and makes the right call on all three weeks.**
+`polish_options={"gate": true}` (`gridlock/polish.py`) delivers the polish
+only when its margin clears the LP threshold within a slack covering the
+measured cut lift (default 0.05%). Weeks 00/09 (+0.227%/+0.292%): polish
+discarded, repair start delivered — the delivery the week09 solves proved
+faster *and* better. Week44 (+0.047%): kept, preserving the one-node
+solve. The gate pays the polish cost either way; what it saves is the
+delivery mistake. `results/sequencing_clustered.csv`.
+
+**The ensemble-screen polish loses, clustered and unclustered.** Pinning
+only what the ensemble vouches for and budgeting the soft residue inside
+the sub-MIP (`polish_options={"soft_budget": N}`) frees too much for the
+600 s budget: every run hit the limit and landed *above* the entry screen
+— +0.845/+0.737/+0.379 against +0.478/+0.347/+0.199 unclustered, worse
+still clustered, where the structural members refuse clusters and the
+soft set collapses to single units. The hypothesis above ("the
+ensemble-screen polish is now the whole game") fails as a polish at this
+budget; whatever found 5,676,660 historically, this restriction is not
+its cheap replica. `results/sequencing_unclustered.csv`.
+
+**The one-shot Lagrangian bound is below the LP bound.** Exact per-unit
+DPs at the LP's own duals (`gridlock/lagrangian.py`) land 0.10-0.54%
+*below* the tight LP bound: the dropped ramp/startup-capability rows carry
+more dual value than per-unit integrality adds, and the tight-vs-loose
+comparison shows the tight rows already extract the per-unit hull money.
+The residual dual gap is cross-unit; no per-unit decomposition reaches it.
+`results/lagrangian_probe_*.csv`.
+
+**The bound is structural — and week09's wall was never the bound.** On
+the byte-identical exported MPS, cold SCIP's root matches HiGHS's on all
+three weeks (±0.01%), killing the "better cut families" hope. But SCIP
+*cracked week09 primal-side*: 6,515,801 at 0.24% gap in 1,381 s, clearing
+the root threshold by 0.225% — a schedule neither this pipeline (floor
+6,545,844) nor HiGHS's own heuristics (no incumbent in 7,000 s cold) ever
+found. It does not generalize: SCIP loses to the pipeline on week00
+(5,738,179 vs 5,699,877) and badly on week44. Per-week complementarity —
+the portfolio argument of 3d, lifted to the solver level. Week00 remains
+unbroken by everything. `results/race_wk*.csv`, `scripts/solver_race.py`.
+
 ## Track 1 — structure
 
 
